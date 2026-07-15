@@ -362,6 +362,15 @@ GitHub 上的源码**不包含运行环境**，仅适合以下场景：
 ## ❓ 常见问题
 
 <details>
+<summary><b>无显卡服务器报错 SharedMemory read failed？</b></summary>
+服务器没有 GPU / Vulkan 驱动时，ncnn Vulkan 子进程反复启动失败导致此报错。
+
+<b>解决方法：</b>打开 <code>ncnn\PPOCR-ncnn-Vulkan\config_safe.json</code>，将 <code>"use_vulkan": true</code> 改为 <code>"use_vulkan": false</code> 即可。改完后完全使用 CPU 运行，不再报错。
+
+> 💡 <b>普通家用电脑不会遇到此问题</b>——集成显卡或独显都自带 Vulkan 驱动，无需任何设置。
+</details>
+
+<details>
 <summary><b>双击启动.bat 后黑框一闪而过？</b></summary>
 解压不完整。确认 <code>portapython\python.exe</code> 文件存在，不要单独移动任何文件夹或修改目录结构。
 </details>
