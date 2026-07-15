@@ -2495,25 +2495,29 @@ class MainWindow(QMainWindow):
         else:  # 纯CPU
             target_engine = "ncnn_cpu"
 
-        # ── 语言兼容性检查：部分语系仅 PP-OCRv5 或 EasyOCR 支持 ──
+        # ── 语言兼容性检查：V5语系语言 ──
         lang_text = self.simple_lang.currentText()
-        # PP-OCRv6/ncnn V6 内嵌字典仅覆盖拉丁/CJK/韩/西里尔
         # v5-only 语系：阿拉伯/天城文/泰文/希腊文/泰卢固/泰米尔 + 多语言(v5)
+        # 这些语言需要 PP-OCRv5 ONNX 模型，umi_plugin_v6 内部已支持路由
         _V5_CODES = {"ar", "fa", "ug", "ur", "hi", "mr", "ne", "sa",
                         "th", "el", "te", "ta", "multilang_v5"}
         _V5_ONLY = {item[0] for item in self._LANG_ITEMS if item[1] in _V5_CODES}
         if lang_text in _V5_ONLY:
-            # v5-only 语言需要 PP-OCRv5 ONNX 引擎
-            v5_idx = self.engine_combo.findData("win7_v5")
-            if v5_idx >= 0:
-                target_engine = "win7_v5"
+            # V5语系语言：umi_plugin_v6 内部已支持路由到 PP-OCRv5 ONNX
+            v6_idx = self.engine_combo.findData("umi_plugin_v6")
+            if v6_idx >= 0:
+                target_engine = "umi_plugin_v6"
             else:
-                # win7_v5 不可用，降级为 ncnn
-                v5_fallback = self.engine_combo.findData("ncnn_vulkan")
-                if v5_fallback >= 0:
-                    target_engine = "ncnn_vulkan"
+                # umi_plugin_v6 不可用时降级到 win7_v5 / ncnn
+                v5_idx = self.engine_combo.findData("win7_v5")
+                if v5_idx >= 0:
+                    target_engine = "win7_v5"
                 else:
-                    target_engine = "ncnn_cpu"
+                    vk_idx = self.engine_combo.findData("ncnn_vulkan")
+                    if vk_idx >= 0:
+                        target_engine = "ncnn_vulkan"
+                    else:
+                        target_engine = "ncnn_cpu"
 
         idx = self.engine_combo.findData(target_engine)
         if idx >= 0:

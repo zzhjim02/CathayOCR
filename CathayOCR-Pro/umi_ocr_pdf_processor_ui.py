@@ -2503,12 +2503,15 @@ class MainWindow(QMainWindow):
                         "th", "el", "te", "ta", "multilang_v5"}
         _V5_ONLY = {item[0] for item in self._LANG_ITEMS if item[1] in _V5_CODES}
         if lang_text in _V5_ONLY:
-            # v5-only 语言需要 PP-OCRv5 ONNX 引擎
-            v5_idx = self.engine_combo.findData("win7_v5")
-            if v5_idx >= 0:
-                target_engine = "win7_v5"
+            # v5-only 语言需要 PP-OCRv5 ONNX 多语言模型
+            # win7_v5（PP-OCRv5 Paddle CPU）是纯中文引擎（keys 仅含汉字+拉丁字符）
+            # 无法识别天城文/阿拉伯文/泰文/希腊文/泰卢固/泰米尔等语言
+            # umi_plugin_v6（PP-OCRv6 ONNX CUDA/CPU）通过 engine=onnxruntime + model_name
+            # 从本地缓存加载 v5 ONNX 多语言模型，正确支持全部 V5 语系
+            v6_idx = self.engine_combo.findData("umi_plugin_v6")
+            if v6_idx >= 0:
+                target_engine = "umi_plugin_v6"
             else:
-                # win7_v5 不可用，降级为 ncnn
                 v5_fallback = self.engine_combo.findData("ncnn_vulkan")
                 if v5_fallback >= 0:
                     target_engine = "ncnn_vulkan"
