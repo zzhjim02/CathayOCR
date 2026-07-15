@@ -305,9 +305,9 @@ graph TD
 
 | 版本 | 格式 | 大小 | 包含内容 | 下载 |
 |:---:|:----:|:----:|:--------|:----:|
-| **Lite 轻量版** | .zip | ~630 MB | ncnn Vulkan 引擎 + 基础模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) ⭐ / [百度网盘](https://pan.baidu.com/s/1z9KDwM9D5tvSwEA5-U4O4w?pwd=bztw)（`bztw`） |
-| **Pro 专业版** | .zip (4 卷) | ~5.7 GB | 6 引擎全量 + CUDA DLL + 全部模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) ⭐ / [百度网盘](https://pan.baidu.com/s/1HUyOWKUd_XDevgaEpNagVg?pwd=zrpz)（`zrpz`） |
-| **DEV 开发版** | .7z (5 卷) | ~7.5 GB | Pro 全部内容 + C++ 引擎源码 + VS 工程 + ncnn 源码 + 开发工具 | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) ⭐ / [百度网盘](https://pan.baidu.com/s/1JYaG_Wzv2loQzsPtvuK2CQ?pwd=ajew)（`ajew`） |
+| **Lite 轻量版** | .zip | ~630 MB | ncnn Vulkan 引擎 + 基础模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) ⭐ / [百度网盘](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026)（`2026`） |
+| **Pro 专业版** | .zip (4 卷) | ~5.7 GB | 6 引擎全量 + CUDA DLL + 全部模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) ⭐ / [百度网盘](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026)（`2026`） |
+| **DEV 开发版** | .7z (5 卷) | ~7.5 GB | Pro 全部内容 + C++ 引擎源码 + VS 工程 + ncnn 源码 + 开发工具 | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) ⭐ / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（`2026`） |
 
 > 💡 **每个安装包都是一个完整的项目文件夹**。里面的 `*.py` 文件用记事本就能直接编辑修改，`ncnn/` 下的 C++ 源码可用 Visual Studio 编译。修改后重新运行 `启动.bat` 即可看到效果。
 
