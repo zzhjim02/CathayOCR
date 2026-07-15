@@ -305,7 +305,7 @@ graph TD
 
 | 版本 | 格式 | 大小 | 包含内容 | 下载 |
 |:---:|:----:|:----:|:--------|:----:|
-| **Lite 轻量版** | .zip | ~630 MB | ncnn Vulkan 引擎 + 基础模型 + 便携 Python | [百度网盘](https://pan.baidu.com/s/1z9KDwM9D5tvSwEA5-U4O4w?pwd=bztw) 提取码：`bztw` |
+| **Lite 轻量版** | .zip | ~630 MB | ncnn Vulkan 引擎 + 基础模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) ⭐ 推荐 |
 | **Pro 专业版** | .zip | ~5.7 GB | 6 引擎全量 + 全部模型 + CUDA DLL (2.4 GB) + 便携 Python | [百度网盘](https://pan.baidu.com/s/1HUyOWKUd_XDevgaEpNagVg?pwd=zrpz) 提取码：`zrpz` |
 | **DEV 开发版** | .7z | ~7.5 GB | Pro 全部内容 + C++ 引擎源码 + VS 工程 + ncnn 源码 + 开发工具 | 即将上传… |
 
