@@ -1,0 +1,96 @@
+# ============================================================
+# CathayOCR .gitignore
+# 源码仓库 - 排除所有二进制/大文件，只保留原创代码
+# ============================================================
+
+# --- 二进制库文件 (DLL/EXE/PYD) ---
+*.dll
+*.exe
+*.pyd
+*.lib
+*.exp
+*.obj
+*.pdb
+*.ilk
+
+# --- OCR 模型文件 ---
+*.bin
+*.param
+*.onnx
+*.pth
+*.pdiparams
+*.pdmodel
+*.pdopt
+
+# --- 便携式 Python 运行时 (6.5 GB) ---
+portapython/
+
+# --- Python 虚拟环境 ---
+easyocr_env/
+ppocr_v6_env/
+surya_env/
+surya_env2/
+lighton_env/
+
+# --- Python 编译缓存 ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyc
+
+# --- 构建产物 ---
+build_vulkan/
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+*.vcxproj*
+*.sln
+*.filters
+Debug/
+Release/
+x64/
+x86/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.tlog
+*.lastbuildstate
+*.manifest
+*.log
+
+# --- 第三方源码/预编译库 ---
+ncnn/libs/
+ncnn/src/3rdparty/
+3rdparty/
+
+# --- 压缩包/安装包 ---
+*.zip
+*.7z
+*.rar
+*.msi
+*.exe
+vulkansdk*.exe
+
+# --- 测试日志/临时文件 ---
+*.log
+*.tmp
+_temp/
+_trash/
+
+# --- 系统文件 ---
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# --- IDE 配置 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- Git LFS 追踪（大文件标记） ---
+# 如果将来需要追踪模型文件，取消下面注释并按需修改
+# *.onnx filter=lfs diff=lfs merge=lfs -text
+# *.bin filter=lfs diff=lfs merge=lfs -text
