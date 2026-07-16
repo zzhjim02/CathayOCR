@@ -366,13 +366,13 @@ GitHub 上的源码**不包含运行环境**，仅适合以下场景：
 ## ❓ 常见问题
 
 <details>
-<summary><b>无显卡服务器报错 SharedMemory read failed？</b></summary>
+<summary><b>无显卡服务器报错 SharedMemory read failed、性能波动大、报错，或OCR结果为空白？</b></summary>
 服务器没有 GPU / Vulkan 驱动时，ncnn Vulkan 子进程反复启动失败导致此报错。
 
 <b>解决方法：</b>打开 <code>ncnn\PPOCR-ncnn-Vulkan\config_safe.json</code>，将 <code>"use_vulkan": true</code> 改为 <code>"use_vulkan": false</code> ，并补充相关Windows运行库即可。改完后完全使用 CPU 运行，不再报错。
 
 > 💡 <b>如仍然报错</b>——应当是当前CPU不支持nccn，可下载专业版，使用其中的PP-OCRv5（Paddle CPU）引擎（其余不需要的引擎可删去，以腾出空间）。
-> 💡 <b>普通家用电脑不会遇到此问题</b>——集成显卡或独显都自带 Vulkan 驱动，无需任何设置。
+>  <b>普通家用电脑不会遇到此问题</b>——集成显卡或独显都自带 Vulkan 驱动，无需任何设置。
 </details>
 
 <details>
