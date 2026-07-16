@@ -374,9 +374,18 @@ GitHub 上的源码**不包含运行环境**，仅适合以下场景：
 
 <details>
 <summary><b>云服务器 / CPU 架构极老的设备可以用吗？</b></summary>
-如果设备极其古老，既没有 Vulkan 驱动、也没有 CUDA 支持（如老旧云服务器），ncnn Vulkan 和 ONNX CUDA 引擎都用不了。但 Pro 版自带 <b>PP-OCRv5 Paddle CPU</b> 引擎，只依赖纯 CPU 计算，在这种设备上也能正常运行。在界面中选择该引擎即可。
 
-> 💡 <b>不想要的引擎可以直接删掉</b>——Pro 版里 Vulkan、CUDA、EasyOCR 等引擎文件夹删了也不影响 PP-OCRv5 的使用，可以省下好几 GB 空间。
+<b>大部分此类低配云服务器是可以正常使用 V6 引擎（ncnn CPU）的。</b>
+
+如果启动或运行时报错，请优先做以下检查：
+
+① 检查是否安装了必要的运行库（VC++ Redistributable 等）；
+② 参照本页「<a href="#-常见问题">无显卡服务器报错 SharedMemory read failed？</a>」中的方法，确认已关闭 Vulkan 模式并调整好相关配置；
+③ 确认相关运行时和库文件已正确安装。
+
+如果经过上述调整后 V6 引擎仍然无法使用，可以尝试下载 <b>Pro 专业版</b>，切换到 <b>PP-OCRv5 Paddle CPU</b> 引擎运行。经测试，部分云服务器可能因为 CPU 架构过于古老，确实无法运行 V6 引擎，而 Pro 版自带的 V5 引擎在这种极低配置下仍可以正常使用。
+
+> 💡 <b>不想要的引擎可以直接删掉</b>——Pro 版里 Vulkan、CUDA、EasyOCR 等引擎文件夹删了也不影响 V5 引擎的使用，可以省下好几 GB 空间。
 </details>
 
 <details>
