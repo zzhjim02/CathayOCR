@@ -322,13 +322,15 @@ graph TD
 |:-------|:-----|
 | ⭐ **GitHub**（推荐国际用户） | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) |
 | 📦 **中国移动云盘**（推荐国内用户） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGRM3Ugv668) |
+| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1gOnx5RE21N_lfLryxtKsxw?pwd=2026) |
 
 #### ② Pro 专业版（~5.8 GB）
 需要识别阿拉伯文、天城文等稀有语言，或需要多引擎对比时选这个。
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **中国移动云盘** | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGqg9P7qKcd) |
+| 📦 **中国移动云盘**（推荐） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGqg9P7qKcd) |
+| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1EQ_GJjYNmoDWJljWZ3y3pw?pwd=2026) |
 
 #### ③ DEV 开发版（~10 GB）
 如果你想研究或修改代码，选这个（含全套源码和开发工具）。
@@ -348,97 +350,7 @@ graph TD
 | **Lite 轻量版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) / [百度网盘](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026)（2026） |
 | **Pro 专业版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) / [百度网盘](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026)（2026） |
 | **DEV 开发版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（2026） |
-## 🔨 从源码构建 / 修改
-
-### 不想编译，只想改改 Python 代码？
-
-任何一个安装包都包含完整的、可读的 Python 源码。你只需要：
-
-```bash
-1. 解压缩安装包
-2. 用记事本 / VS Code 打开 CathayOCR-Xxx/umi_ocr_pdf_processor_ui.py
-3. 随便改
-4. 双击「启动.bat」运行看效果
-```
-
-> 就是这么简单。甚至不需要安装 Python——安装包里自带。
-
-### 想编译 C++ OCR 引擎？
-
-下载 **DEV 开发版**，它包含了编译所需的一切：
-
-```bash
-# 环境要求
-- Visual Studio 2022（含 C++ 桌面开发工作负载）
-- CMake 3.20+（DEV 版自带）
-- Vulkan SDK 1.4+（DEV 版含安装包）
-
-# 构建 ncnn OCR 引擎
-cd CathayOCR-Dev/ncnn
-
-# 构建 CPU 版本
-build_cpu.cmd
-
-# 构建 Vulkan 版本（需先安装 Vulkan SDK）
-build_vulkan_and_deploy.cmd
-```
-
-### 这个仓库里的纯源码怎么用？
-
-GitHub 上的源码**不包含运行环境**，仅适合以下场景：
-- **阅读和学习**代码结构
-- **提交 Issue 或 PR**
-- **对比各版本差异**
-
-**要实际运行或修改，请直接下载安装包。**
-
----
-
-## ❓ 常见问题
-
-<details>
-<summary><b>无显卡服务器报错 SharedMemory read failed、性能波动大、报错，或OCR结果为空白？</b></summary>
-服务器没有 GPU / Vulkan 驱动时，ncnn Vulkan 子进程反复启动失败导致此报错。
-
-<b>解决方法：</b>打开 <code>ncnn\PPOCR-ncnn-Vulkan\config_safe.json</code>，将 <code>"use_vulkan": true</code> 改为 <code>"use_vulkan": false</code> ，并补充相关Windows运行库即可。改完后完全使用 CPU 运行，不再报错。
-
-> 💡 <b>如仍然报错</b>——应当是当前CPU不支持nccn，可下载专业版，使用其中的PP-OCRv5（Paddle CPU）引擎（其余不需要的引擎可删去，以腾出空间）。
->  <b>普通家用电脑不会遇到此问题</b>——集成显卡或独显都自带 Vulkan 驱动，无需任何设置。
-</details>
-
-<details>
-<summary><b>云服务器 / 老旧设备上引擎报错怎么办？</b></summary>
-
-<b>问题：</b>一些低配云服务器或老旧设备没有 Vulkan 驱动、没有 CUDA 支持，导致 ncnn Vulkan、ONNX CUDA 等 GPU 引擎用不了。
-
-> 💡 <b>家用电脑一般不会遇到此问题</b>——集成显卡或独显都自带 Vulkan 驱动。
-
-————
-
-<b>解决办法：</b>
-
-<b>① 用 Lite 版的 ncnn CPU 引擎（V6）</b>
-
-大多数这类设备用这个引擎就能跑。但前提是先按本页「无显卡服务器报错」FAQ 中的方法做好修改——关闭 Vulkan 模式、安装必要的运行库。改好了就可以正常使用 V6 CPU 引擎。
-
-<b>② V6 不行的话 → 下载 Pro 版，用 PP-OCRv5 Paddle CPU 引擎</b>
-
-如果经过上述修改后 V6 引擎仍然无法运行（说明这台设备的 CPU 架构可能过于古老），可以下载 Pro 专业版，在界面引擎列表最下方选择 <b>PP-OCRv5 Paddle CPU</b>。这个老兼容引擎独立于 ncnn，纯 CPU 运行，在这种极低的配置下也能正常使用。
-
-> 💡 Pro 版里不用的引擎文件夹可以删掉，不占空间。
-</details>
-
-<details>
-<summary><b>双击启动.bat 后黑框一闪而过？</b></summary>
-解压不完整。确认 <code>portapython\python.exe</code> 文件存在，不要单独移动任何文件夹或修改目录结构。
-</details>
-
-<details>
-<summary><b>Lite 版和 Pro 版选哪个？</b></summary>
-<b>对大多数学者来说 Lite 版就够了。</b>Lite 版使用 ncnn Vulkan 引擎，支持任意品牌 GPU 加速，没显卡也能跑 CPU 模式。**多数语言的识别精度 Lite 版就是最高的**。Pro 版多了 ONNX CUDA、EasyOCR 和 Paddle 备胎引擎，适合需要阿拉伯文 / 天城文识别，或想在不同引擎间对比效果的用户。
-</details>
-
-<details>
+>
 <summary><b>进度不动了 / 卡住了？</b></summary>
 点击「停止」→ 关掉程序 → 重新打开。如果频繁卡住：① 检查任务管理器有无残留 OCR 进程；② 调低批处理数；③ 换 ncnn CPU 引擎。
 </details>
