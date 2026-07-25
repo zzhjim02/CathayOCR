@@ -307,38 +307,47 @@ graph TD
 
 ---
 
-## 🔧 安装包下载
+## 🏛️ 安装包下载
 
-> 安装包内含**完整 Python 3.10 解释器 + 全部依赖库 + CUDA DLL + OCR 模型**，真正做到 **解压即用，无需任何安装步骤**。
->
-> ⚠️ GitHub 仓库仅包含源码，如需直接使用或修改，请下载以下安装包：
-
-| 版本 | 版本号 | 格式 | 大小 | 包含内容 | 下载 |
-|:---:|:-----:|:----:|:----:|:--------|:----:|
-| 版本 | 版本号 | 格式 | 大小 | 包含内容 | 下载 |
-|:---:|:-----:|:----:|:----:|:--------|:----:|
-| **Lite 轻量版** | v1.1.0 ⭐ | .zip | ~640 MB | 🔧 bug 修复版 | [GitHub Release](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) ⭐ / 中国移动云盘（推荐）：[下载](https://yun.139.com/shareweb/#/w/i/2wFGRM3Ugv668) |
-| **Pro 专业版** | v1.1.0 | .zip | ~5.8 GB | 🔧 bug 修复版 | 中国移动云盘（推荐）：[下载](https://yun.139.com/shareweb/#/w/i/2wFGqg9P7qKcd) |
-| **DEV 开发版** | v1.1.0 | .zip | ~10 GB | 🔧 bug 修复版 | [百度网盘](https://pan.baidu.com/s/1wtRRCphaUWg8whdgp2cwsA?pwd=2026)（`2026`） |
-| **Lite 轻量版** | v1.0.0 | .zip | ~630 MB | ncnn Vulkan 引擎 + 基础模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) ⭐ / [百度网盘](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026)（`2026`） |
-| **Pro 专业版** | v1.0.0 | .zip (4 卷) | ~5.7 GB | 6 引擎全量 + CUDA DLL + 全部模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) / [百度网盘](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026)（`2026`） |
-| **DEV 开发版** | v1.0.0 | .7z (5 卷) | ~7.5 GB | Pro 全部内容 + C++ 引擎源码 + VS 工程 + ncnn 源码 + 开发工具 | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（`2026`） |
-| **DEV 开发版** | v1.0.0 | .7z (5 卷) | ~7.5 GB | Pro 全部内容 + C++ 引擎源码 + VS 工程 + ncnn 源码 + 开发工具 | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（`2026`） |
--:|:----:|:----:|:--------|:----:|
-| 版本 | 版本号 | 格式 | 大小 | 包含内容 | 下载 |
-|:---:|:-----:|:----:|:----:|:--------|:----:|
-| **Lite 轻量版** | v1.1.0 ⭐ | .zip | ~640 MB | 🔧 bug 修复版 | [GitHub Release](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) ⭐ / 中国移动云盘（推荐）：[下载](https://yun.139.com/shareweb/#/w/i/2wFGRM3Ugv668) |
-| **Pro 专业版** | v1.1.0 | .zip | ~5.8 GB | 🔧 bug 修复版 | 中国移动云盘（推荐）：[下载](https://yun.139.com/shareweb/#/w/i/2wFGqg9P7qKcd) |
-| **DEV 开发版** | v1.1.0 | .zip | ~10 GB | 🔧 bug 修复版 | [百度网盘](https://pan.baidu.com/s/1wtRRCphaUWg8whdgp2cwsA?pwd=2026)（`2026`） |
-| **Lite 轻量版** | v1.0.0 | .zip | ~630 MB | ncnn Vulkan 引擎 + 基础模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) ⭐ / [百度网盘](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026)（`2026`） |
-| **Pro 专业版** | v1.0.0 | .zip (4 卷) | ~5.7 GB | 6 引擎全量 + CUDA DLL + 全部模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) / [百度网盘](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026)（`2026`） |
-| **DEV 开发版** | v1.0.0 | .7z (5 卷) | ~7.5 GB | Pro 全部内容 + C++ 引擎源码 + VS 工程 + ncnn 源码 + 开发工具 | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（`2026`） |
-| **DEV 开发版** | v1.0.0 | .7z (5 卷) | ~7.5 GB | Pro 全部内容 + C++ 引擎源码 + VS 工程 + ncnn 源码 + 开发工具 | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) ⭐ / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（6\） |
-
-> 💡 **每个安装包都是一个完整的项目文件夹**。里面的 `*.py` 文件用记事本就能直接编辑修改，`ncnn/` 下的 C++ 源码可用 Visual Studio 编译。修改后重新运行 `启动.bat` 即可看到效果。
+> 安装包内含 **完整 Python 3.10 + 全部依赖 + CUDA DLL + OCR 模型**，解压即用，无需任何安装步骤。
 
 ---
 
+### 🚀 推荐下载（最新版 v1.1.0）
+
+#### ① Lite 轻量版（~640 MB）← 大多数人选这个！
+适合识别中文、日文、韩文等常见语言，开箱即用。
+
+| 下载方式 | 链接 |
+|:-------|:-----|
+| ⭐ **GitHub**（推荐国际用户） | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) |
+| 📦 **中国移动云盘**（推荐国内用户） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGRM3Ugv668) |
+
+#### ② Pro 专业版（~5.8 GB）
+需要识别阿拉伯文、天城文等稀有语言，或需要多引擎对比时选这个。
+
+| 下载方式 | 链接 |
+|:-------|:-----|
+| 📦 **中国移动云盘** | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGqg9P7qKcd) |
+
+#### ③ DEV 开发版（~10 GB）
+如果你想研究或修改代码，选这个（含全套源码和开发工具）。
+
+| 下载方式 | 链接 |
+|:-------|:-----|
+| 📦 **百度网盘**（密码 2026） | [点击下载](https://pan.baidu.com/s/1wtRRCphaUWg8whdgp2cwsA?pwd=2026) |
+
+---
+
+### 📦 旧版本下载（v1.0.0）
+
+> 如果你正在用旧版本且用得没问题，可以继续用。以下为原有下载链接：
+
+| 版本 | 下载 |
+|:----|:----|
+| **Lite 轻量版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) / [百度网盘](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026)（2026） |
+| **Pro 专业版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) / [百度网盘](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026)（2026） |
+| **DEV 开发版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（2026） |
 ## 🔨 从源码构建 / 修改
 
 ### 不想编译，只想改改 Python 代码？
