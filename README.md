@@ -311,7 +311,7 @@ graph TD
 |:---:|:-----:|:----:|:----:|:--------|:----:|
 | **Lite 轻量版** | v1.1.0 ⭐ | .zip | ~640 MB | 🔧 bug 修复版 | [GitHub Release](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) / [百度网盘](https://pan.baidu.com/s/1gOnx5RE21N_lfLryxtKsxw?pwd=2026)（6\） |
 | **Pro 专业版** | v1.1.0 | .zip | ~5.8 GB | 🔧 bug 修复版 | [GitHub Release](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0-pro) / [百度网盘](https://pan.baidu.com/s/1EQ_GJjYNmoDWJljWZ3y3pw?pwd=2026)（6\） |
-| **DEV 开发版** | v1.1.0 | .zip | ~10 GB | 🔧 bug 修复版 | [GitHub Release](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0-dev) / 百度网盘链接待补充 |
+| **DEV 开发版** | v1.1.0 | .zip | ~10 GB | 🔧 bug 修复版 | [GitHub Release](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0-dev) / 百度网盘](https://pan.baidu.com/s/1Ls7epo6DqZXSAH7pa2ouSg?pwd=2026)(2026) |
 | **Lite 轻量版** | v1.0.0 | .zip | ~630 MB | ncnn Vulkan 引擎 + 基础模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) ⭐ / [百度网盘](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026)（6\） |
 | **Pro 专业版** | v1.0.0 | .zip (4 卷) | ~5.7 GB | 6 引擎全量 + CUDA DLL + 全部模型 + 便携 Python | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) ⭐ / [百度网盘](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026)（6\） |
 | **DEV 开发版** | v1.0.0 | .7z (5 卷) | ~7.5 GB | Pro 全部内容 + C++ 引擎源码 + VS 工程 + ncnn 源码 + 开发工具 | [GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) ⭐ / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（6\） |
