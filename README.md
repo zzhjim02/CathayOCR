@@ -382,35 +382,64 @@ Umi-OCR 更适合单张图片或少量文字的屏幕识别。CathayOCR 是专�
 
 ---
 
-## 📖 配套工具：Cathay Reader
+## 🔗 Cathay 人文研究工具链
 
 <div align="center">
 
-**CathayOCR 的双栏同步阅读器 —— 对照校勘 OCR 结果的必备工具**
-
-<a href="https://github.com/zzhjim02/CathayReader">
-<img src="https://img.shields.io/badge/GitHub-CathayReader-blue?logo=github" alt="GitHub"/>
-</a>
-<a href="https://github.com/zzhjim02/CathayReader/releases">
-<img src="https://img.shields.io/github/v/release/zzhjim02/CathayReader" alt="Release"/>
-</a>
+| 步骤 | 工具 | 功能 | 状态 |
+|:----:|:----|:----|:----:|
+| ① | [**CathayOCR**</br>![GitHub](https://img.shields.io/github/stars/zzhjim02/CathayOCR?style=social)](https://github.com/zzhjim02/CathayOCR) | 📄 多引擎 GPU 加速</br>古籍 PDF 批处理 OCR | ✅ v1.1.0 |
+| ② | [**CathaySimplify**</br>![GitHub](https://img.shields.io/github/stars/zzhjim02/CathaySimplify?style=social)](https://github.com/zzhjim02/CathaySimplify) | 🔄 TXT 繁简体双向转换</br>编码智能适配 | ✅ v1.0.0 |
+| ③ | [**CathayReader**</br>![GitHub](https://img.shields.io/github/stars/zzhjim02/CathayReader?style=social)](https://github.com/zzhjim02/CathayReader) | 📖 PDF/TXT 双栏同步</br>古籍校勘阅读器 | ✅ v1.0.0 |
 
 </div>
 
-使用 **CathayOCR** 处理完古籍 PDF 后，会生成双层 PDF 和纯文本 TXT 文件。**Cathay Reader** 可以将它们左右并排显示，同步滚动，方便校勘。
+**典型工作流：**
 
-| 功能 | 说明 |
-|:----|:------|
-| 📂 **智能配对** | 自动匹配同名的 PDF + TXT |
-| 📑 **双栏同步** | 左侧 PDF、右侧 TXT，翻页/滚动同步 |
-| 🔍 **全文搜索** | Ctrl+F 在两侧同时高亮 |
-| 📄 **复制文字** | 选中复制、复制整页带出处标注 |
-| 🔤 **繁简切换** | 一键转换为简体或繁体 |
-
-> 前往 **[Cathay Reader 仓库](https://github.com/zzhjim02/CathayReader)** 下载发行版或查看源码。
+```
+CathayOCR (OCR 古籍 PDF → 繁体 TXT)
+     ↓
+CathaySimplify (繁体 TXT → 简体 TXT)
+     ↓
+CathayReader (PDF 原图 + TXT 双栏校勘 → 定稿)
+```
 
 ---
 
+## 📖 配套工具详情
+
+### ② CathaySimplify — TXT 繁简体批量双向转换
+
+> 仓库：**[github.com/zzhjim02/CathaySimplify](https://github.com/zzhjim02/CathaySimplify)**
+
+CathaySimplify 是工作流的第 2 步：将 OCR 识别出的繁体 TXT 批量转为简体（或反之），智能检测编码、自动跳过已转换文件。
+
+| 功能 | 说明 |
+|:----|:------|
+| 🔄 **双向转换** | 繁→简 或 简→繁，OpenCC 规则精确 |
+| 🧠 **智能去重** | 已有输出文件时自动跳过，避免重复 |
+| 🌐 **编码适配** | 自动检测 UTF-8/GBK/BIG5 等，统一输出 UTF-8 |
+| 🖥️ **图形界面** | Tkinter GUI + 拖放支持，免命令行 |
+
+```bash
+pip install opencc-python-reimplemented chardet tkinterdnd2
+python converter.py
+```
+
+### ③ CathayReader — PDF/TXT 双栏同步古籍校勘阅读器
+
+> 仓库：**[github.com/zzhjim02/CathayReader](https://github.com/zzhjim02/CathayReader)**
+
+CathayReader 是工作流的第 3 步：将 OCR 双层 PDF 和转换后的 TXT 左右并排显示，同步滚动，方便逐字校勘。
+
+| 功能 | 说明 |
+|:----|:------|
+| 📑 **双栏同步** | 左侧 PDF、右侧 TXT，翻页/滚动同步 |
+| 🔍 **全文搜索** | Ctrl+F 在两侧同时高亮 |
+| 📄 **复制整页** | 含出处标注，方便引用 |
+| 🔤 **繁简切换** | TXT 侧一键繁简 |
+
+> 前往 **[CathayReader 仓库](https://github.com/zzhjim02/CathayReader)** 下载发行版或查看源码。
 ## 🛠️ 技术栈与上游项目
 
 ### 直接使用的上游项目
