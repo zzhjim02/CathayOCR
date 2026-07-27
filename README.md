@@ -245,7 +245,7 @@ graph TD
     UI[PyQt5 用户界面] --> SM{模式选择}
     SM -->|🎯 简单模式| Auto[自动参数映射]
     SM -->|🔧 专业模式| Manual[手动参数配置]
-    Auto --> Engine[引擎调度器 [ENGINE_REGISTRY]]
+    Auto --> Engine["引擎调度器 [ENGINE_REGISTRY]"]
     Manual --> Engine
 
     Engine --> NCNN[⭐ ncnn Vulkan<br/>TCP 持久连接<br/>任意品牌 GPU]
