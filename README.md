@@ -26,6 +26,25 @@
 >
 > ⬇️ [点击这里直接下载 v1.1.0](#-安装包下载)（保留旧版本下载链接，放心下载）
 ---
+## 🔗 Cathay 人文研究工具链
+
+<div align="center">
+
+| 步骤 | 工具 | 功能 | 状态 |
+|:----:|:----|:----|:----:|
+| ① | **⭐ CathayOCR (你在这里)** | 📄 多引擎 GPU 加速古籍 PDF 批处理 OCR | ✅ v1.1.0 |
+| ② | [**CathaySimplify** →](https://github.com/zzhjim02/CathaySimplify) | 🔄 TXT 繁简体批量双向转换 · 编码智能适配 | ✅ v1.0.0 |
+| ③ | [**CathayReader** →](https://github.com/zzhjim02/CathayReader) | 📖 PDF/TXT 双栏同步古籍校勘阅读器 | ✅ v1.0.0 |
+
+</div>
+
+**三步完成古籍数字化：** `CathayOCR` 扫描 PDF → `CathaySimplify` 繁简统一 → `CathayReader` 双栏校勘
+
+> 📌 **这是本仓库（CathayOCR）** — 工作流第 1 步。
+> 配套工具：[CathaySimplify](https://github.com/zzhjim02/CathaySimplify)（繁简转换）· [CathayReader](https://github.com/zzhjim02/CathayReader)（双栏校勘）
+
+---
+
 
 ## 📖 目录
 
@@ -381,129 +400,5 @@ Umi-OCR 更适合单张图片或少量文字的屏幕识别。CathayOCR 是专�
 </details>
 
 ---
-
-## 🔗 Cathay 人文研究工具链
-
-<div align="center">
-
-| 步骤 | 工具 | 功能 | 状态 |
-|:----:|:----|:----|:----:|
-| ① | [**CathayOCR**</br>![GitHub](https://img.shields.io/github/stars/zzhjim02/CathayOCR?style=social)](https://github.com/zzhjim02/CathayOCR) | 📄 多引擎 GPU 加速</br>古籍 PDF 批处理 OCR | ✅ v1.1.0 |
-| ② | [**CathaySimplify**</br>![GitHub](https://img.shields.io/github/stars/zzhjim02/CathaySimplify?style=social)](https://github.com/zzhjim02/CathaySimplify) | 🔄 TXT 繁简体双向转换</br>编码智能适配 | ✅ v1.0.0 |
-| ③ | [**CathayReader**</br>![GitHub](https://img.shields.io/github/stars/zzhjim02/CathayReader?style=social)](https://github.com/zzhjim02/CathayReader) | 📖 PDF/TXT 双栏同步</br>古籍校勘阅读器 | ✅ v1.0.0 |
-
-</div>
-
-**典型工作流：**
-
-```
-CathayOCR (OCR 古籍 PDF → 繁体 TXT)
-     ↓
-CathaySimplify (繁体 TXT → 简体 TXT)
-     ↓
-CathayReader (PDF 原图 + TXT 双栏校勘 → 定稿)
-```
-
----
-
-## 📖 配套工具详情
-
-### ② CathaySimplify — TXT 繁简体批量双向转换
-
-> 仓库：**[github.com/zzhjim02/CathaySimplify](https://github.com/zzhjim02/CathaySimplify)**
-
-CathaySimplify 是工作流的第 2 步：将 OCR 识别出的繁体 TXT 批量转为简体（或反之），智能检测编码、自动跳过已转换文件。
-
-| 功能 | 说明 |
-|:----|:------|
-| 🔄 **双向转换** | 繁→简 或 简→繁，OpenCC 规则精确 |
-| 🧠 **智能去重** | 已有输出文件时自动跳过，避免重复 |
-| 🌐 **编码适配** | 自动检测 UTF-8/GBK/BIG5 等，统一输出 UTF-8 |
-| 🖥️ **图形界面** | Tkinter GUI + 拖放支持，免命令行 |
-
-```bash
-pip install opencc-python-reimplemented chardet tkinterdnd2
-python converter.py
-```
-
-### ③ CathayReader — PDF/TXT 双栏同步古籍校勘阅读器
-
-> 仓库：**[github.com/zzhjim02/CathayReader](https://github.com/zzhjim02/CathayReader)**
-
-CathayReader 是工作流的第 3 步：将 OCR 双层 PDF 和转换后的 TXT 左右并排显示，同步滚动，方便逐字校勘。
-
-| 功能 | 说明 |
-|:----|:------|
-| 📑 **双栏同步** | 左侧 PDF、右侧 TXT，翻页/滚动同步 |
-| 🔍 **全文搜索** | Ctrl+F 在两侧同时高亮 |
-| 📄 **复制整页** | 含出处标注，方便引用 |
-| 🔤 **繁简切换** | TXT 侧一键繁简 |
-
-> 前往 **[CathayReader 仓库](https://github.com/zzhjim02/CathayReader)** 下载发行版或查看源码。
-## 🛠️ 技术栈与上游项目
-
-### 直接使用的上游项目
-
-| 项目 | 用途 | 许可 |
-|:----|:----|:----:|
-| [Umi-OCR](https://github.com/hiroi-sora/Umi-OCR) | OCR 管道架构、通信协议参考 | MIT |
-| [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) | PP-OCR v3/v5/v6 模型训练框架、字典文件 | Apache 2.0 |
-| [Paddle Inference](https://github.com/PaddlePaddle/Paddle) | PP-OCRv3/v5 的 C++ 推理引擎 | Apache 2.0 |
-| [ncnn](https://github.com/Tencent/ncnn) | 高性能神经网络推理框架（Vulkan + CPU 跨平台加速） | BSD 3-Clause |
-| [ppocr-ncnn-cpp](https://github.com/CrumpetTurtle/ppocr-ncnn-cpp) | ncnn 版 PP-OCR 引擎的 C++ 实现（本项目核心引擎源码二次开发基础） | — |
-| [ONNX Runtime](https://github.com/microsoft/onnxruntime) | PP-OCRv6 的 CUDA / TensorRT 加速推理 | MIT |
-| [PyMuPDF (fitz)](https://github.com/pymupdf/PyMuPDF) | PDF 渲染引擎 | AGPL |
-| [PyQt5](https://riverbankcomputing.com/software/pyqt/) | GUI 框架 | GPL |
-| [EasyOCR](https://github.com/JaidedAI/EasyOCR) | 多语言 OCR 引擎（韩文 / 俄文） | Apache 2.0 |
-
-### 本项目引用的 PP-OCR 模型转换版及插件
-
-本项目使用了以下社区转换的 PP-OCR 模型格式及上游 Umi-OCR 插件：
-
-| 模型格式 / 插件 | 来源 | 说明 |
-|:----------------|:-----|:-----|
-| **ncnn 模型 (.param + .bin)** | 基于 PaddleOCR 官方模型经 ncnn 工具链转换 | 用于 ncnn Vulkan / ncnn CPU 引擎 |
-| **ONNX 模型 (.onnx)** | 基于 PaddleOCR 官方模型经 paddle2onnx 转换 | 用于 PP-OCRv6 ONNX CUDA 引擎 |
-| **Paddle Inference 模型** | PaddleOCR 官方发布格式 | 用于 PP-OCRv3/v5 引擎 |
-| **EasyOCR 模型 (.pth)** | EasyOCR 社区训练模型 | 用于 EasyOCR 引擎 |
-| [PaddleOCR-json_PP-OCRv5_umi_plugin](https://github.com/OneDongua/PaddleOCR-json_PP-OCRv5_umi_plugin) | 社区 Umi-OCR 插件 | PP-OCRv5 引擎集成参考 |
-| [UmiOCR-AI-OCR-Plugin](https://github.com/EatWorld/UmiOCR-AI-OCR-Plugin) | 社区 Umi-OCR 插件 | AI-OCR 插件集成参考 |
-| [UmiOCR-PP-OCRv6-ONNX-Plugin](https://github.com/4965898/UmiOCR-PP-OCRv6-ONNX-Plugin/) | 社区 Umi-OCR 插件（含 Vulkan 实验版） | PP-OCRv6 ONNX CUDA 引擎集成参考，也是本项目 ppocr_v6/ 模块的基础 |
-
-### 本项目 C++ / Python 技术选型
-
-| 组件 | 技术 |
-|:----|:----|
-| **GUI 框架** | PyQt5 |
-| **PDF 渲染** | PyMuPDF (MuPDF) |
-| **主力 OCR 引擎（GPU）** | ncnn C++ (Vulkan) / ONNX Runtime Python (CUDA) |
-| **主力 OCR 引擎（CPU）** | ncnn C++ (CPU) |
-| **备选 OCR 引擎** | Paddle Inference C++ / EasyOCR Python |
-| **通信协议** | TCP 持久连接（ncnn Vulkan）/ 管道 JSON（其余引擎） |
-| **便携 Python** | Embedded Python 3.10 (portapython) |
-| **C++ 构建** | CMake + Visual Studio 2022 |
-| **GPU 加速库** | Vulkan (ncnn) / CUDA 12.x + cuBLAS + cuDNN (ONNX Runtime) |
-
----
-
-## 📜 许可证
-
-本项目基于 **GPLv3** 许可证开源，详见 [LICENSE](LICENSE) 文件。
-
-使用本项目时，请同时遵守上游项目的许可条款。各引擎本身均为各自开源许可证下的独立项目，CathayOCR 作为整合层进行调用。
-
----
-
-<div align="center">
-
-**如果这个工具帮到了你，欢迎 ⭐ Star 支持！**
-
-[![GitHub stars](https://img.shields.io/github/stars/zzhjim02/CathayOCR?style=social)]()
-
-*用 AI 为古籍续命，让历史不那么容易被遗忘。*
-
-</div>
-
-
 
 
