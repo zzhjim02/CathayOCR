@@ -382,6 +382,35 @@ Umi-OCR 更适合单张图片或少量文字的屏幕识别。CathayOCR 是专�
 
 ---
 
+## 📖 配套工具：Cathay Reader
+
+<div align="center">
+
+**CathayOCR 的双栏同步阅读器 —— 对照校勘 OCR 结果的必备工具**
+
+<a href="https://github.com/zzhjim02/CathayReader">
+<img src="https://img.shields.io/badge/GitHub-CathayReader-blue?logo=github" alt="GitHub"/>
+</a>
+<a href="https://github.com/zzhjim02/CathayReader/releases">
+<img src="https://img.shields.io/github/v/release/zzhjim02/CathayReader" alt="Release"/>
+</a>
+
+</div>
+
+使用 **CathayOCR** 处理完古籍 PDF 后，会生成双层 PDF 和纯文本 TXT 文件。**Cathay Reader** 可以将它们左右并排显示，同步滚动，方便校勘。
+
+| 功能 | 说明 |
+|:----|:------|
+| 📂 **智能配对** | 自动匹配同名的 PDF + TXT |
+| 📑 **双栏同步** | 左侧 PDF、右侧 TXT，翻页/滚动同步 |
+| 🔍 **全文搜索** | Ctrl+F 在两侧同时高亮 |
+| 📄 **复制文字** | 选中复制、复制整页带出处标注 |
+| 🔤 **繁简切换** | 一键转换为简体或繁体 |
+
+> 前往 **[Cathay Reader 仓库](https://github.com/zzhjim02/CathayReader)** 下载发行版或查看源码。
+
+---
+
 ## 🛠️ 技术栈与上游项目
 
 ### 直接使用的上游项目
