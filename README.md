@@ -339,7 +339,7 @@ graph TD
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| ⭐ **GitHub**（推荐国际用户） | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.2) |
+| ⭐ **GitHub**（推荐国际用户） | 待补充 |
 | 📦 **中国移动云盘**（推荐国内用户） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGUzgcebid5) |
 | 📦 **百度网盘**（备用，密码 2026） | 待补充 |
 
