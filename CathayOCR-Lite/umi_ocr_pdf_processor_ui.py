@@ -23,6 +23,19 @@ from abc import ABC, abstractmethod
 import socket
 import tempfile
 
+# Fix Qt platform plugin path for portable Python
+try:
+    import PyQt5
+    _pyqt_dir = os.path.dirname(PyQt5.__file__)
+    _qt_bin = os.path.join(_pyqt_dir, 'Qt5', 'bin')
+    _qt_plugins = os.path.join(_pyqt_dir, 'Qt5', 'plugins', 'platforms')
+    if os.path.isdir(_qt_bin):
+        os.environ['PATH'] = _qt_bin + os.pathsep + os.environ.get('PATH', '')
+    if os.path.isdir(_qt_plugins):
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = _qt_plugins
+except Exception:
+    pass
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog,
@@ -858,9 +871,21 @@ class NcnnVulkanAdapter(OCREngineAdapter):
     def run_base64(self, image_base64, timeout=180):
         try:
             img_bytes = _b64.b64decode(image_base64)
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                tmp.write(img_bytes)
-                tmp_path = tmp.name
+            # 复用固定临时文件：避免每页创建/删除临时文件（省磁盘I/O）
+            if not getattr(self, "_tmp_path", None):
+                try:
+                    fd, self._tmp_path = tempfile.mkstemp(suffix=".png")
+                    os.close(fd)
+                except Exception:
+                    self._tmp_path = None
+            if self._tmp_path:
+                with open(self._tmp_path, "wb") as f:
+                    f.write(img_bytes)
+                tmp_path = self._tmp_path
+            else:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(img_bytes)
+                    tmp_path = tmp.name
             try:
                 if self._use_gpu:
                     request = {"img_path": tmp_path.replace("\\", "/")}
@@ -868,10 +893,12 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                 else:
                     return self._run_exe(tmp_path, timeout)
             finally:
-                try:
-                    os.unlink(tmp_path)
-                except Exception:
-                    pass
+                # 非复用回退路径仍需清理
+                if not self._tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
         except Exception as e:
             return {"code": 900, "data": f"Base64 error: {str(e)}"}
 
@@ -883,6 +910,14 @@ class NcnnVulkanAdapter(OCREngineAdapter):
             return self._run_exe(img_path, timeout)
 
     def stop(self):
+        # 清理复用的临时文件
+        tmp_path = getattr(self, "_tmp_path", None)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            self._tmp_path = None
         if self._use_gpu:
             if self.server_proc is not None:
                 try:
@@ -1055,7 +1090,6 @@ class PDFProcessor:
         self.completed_count = 0
         self._total_done = 0
         self._start_time = 0
-        self.completed_count = 0
 
     @property
     def is_paused(self):
@@ -1091,14 +1125,20 @@ class PDFProcessor:
         return fontsize
 
     def render_page_to_bytes(self, pdf_path, page_num, scale=2.0):
+        # 兼容旧接口：单页渲染（内部自行打开/关闭文档）
         with _suppress_mupdf_warnings():
             doc = fitz.open(pdf_path)
+        try:
+            return self.render_page_from_doc(doc, page_num, scale)
+        finally:
+            doc.close()
+
+    def render_page_from_doc(self, doc, page_num, scale=2.0):
+        """复用已打开的Document渲染单页（避免每页重复open大PDF）"""
         page = doc[page_num]
         mat = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
-        png_bytes = pix.tobytes("png")
-        doc.close()
-        return png_bytes
+        return pix.tobytes("png")
 
     def process_pdf(self, input_path, output_dir, total_pages, scale=2.0,
                     progress_callback=None):
@@ -1113,23 +1153,41 @@ class PDFProcessor:
         _render_done_count = [0]
         _render_done_lock = threading.Lock()
         def render_worker(start_page, end_page):
-            for pn in range(start_page, end_page):
-                if self._cancelled:
-                    return
-                self.wait_if_paused()
-                if self._cancelled:
-                    return
+            # 每个渲染线程只open一次PDF文档，线程内复用渲染所有页
+            # 避免每页重复解析整个PDF（大文件可省大量CPU）
+            try:
+                with _suppress_mupdf_warnings():
+                    doc = fitz.open(input_path)
+            except Exception as e:
+                print(f"[Render] open failed: {e}")
+                with _render_done_lock:
+                    _render_done_count[0] += 1
+                    if _render_done_count[0] >= self._num_workers:
+                        all_done.set()
+                return
+            try:
+                for pn in range(start_page, end_page):
+                    if self._cancelled:
+                        return
+                    self.wait_if_paused()
+                    if self._cancelled:
+                        return
+                    try:
+                        png_bytes = self.render_page_from_doc(doc, pn, scale)
+                        b64_data = _b64.b64encode(png_bytes).decode("ascii")
+                        while not self._cancelled:
+                            try:
+                                render_queue.put((pn, b64_data), timeout=1)
+                                break
+                            except Full:
+                                continue
+                    except Exception as e:
+                        print(f"[Render] Page {pn} error: {e}")
+            finally:
                 try:
-                    png_bytes = self.render_page_to_bytes(input_path, pn, scale)
-                    b64_data = _b64.b64encode(png_bytes).decode("ascii")
-                    while not self._cancelled:
-                        try:
-                            render_queue.put((pn, b64_data), timeout=1)
-                            break
-                        except Full:
-                            continue
-                except Exception as e:
-                    print(f"[Render] Page {pn} error: {e}")
+                    doc.close()
+                except Exception:
+                    pass
             with _render_done_lock:
                 _render_done_count[0] += 1
                 if _render_done_count[0] >= self._num_workers:
@@ -1141,7 +1199,7 @@ class PDFProcessor:
             t0 = time.time()
             while my_done < total_pages and not self._cancelled:
                 try:
-                    pn, b64_data = render_queue.get(timeout=2)
+                    pn, b64_data = render_queue.get(timeout=0.3)
                 except Empty:
                     if all_done.is_set():
                         break
@@ -1175,9 +1233,18 @@ class PDFProcessor:
                     progress_callback(self._total_done, total_pages, next_to_store)
         num_consumers = 2 if self.dual_instance else 1
         render_queue = Queue(maxsize=20 if num_consumers > 1 else 12)
-        # 渲染线程数 ≈ CPU核数-消费者数，留足CPU给OCR进程
+        # 渲染线程数：渲染能力(20~50页/秒)远大于OCR消化能力(1~4页/秒)，
+        # 线程数永远不会成为瓶颈；过多线程反而与OCR进程抢CPU导致GPU空转。
+        # 按文件规模动态调整：小文件少线程（省线程开销），大文件取平衡值。
         cpu_cores = os.cpu_count() or 8
-        n_workers = min(max(4, cpu_cores - num_consumers), total_pages, 32)
+        if total_pages <= 30:
+            # 小文件：2线程渲染足够（全部渲染完也只需1~3秒，而OCR要几十秒）
+            n_workers = min(2, total_pages)
+        else:
+            # 大文件：自适应渲染线程数（CPU核心数 - 消费实例数），最多32
+            n_workers = min(max(4, cpu_cores - num_consumers), total_pages, 32)
+            n_workers = min(n_workers, total_pages)
+        n_workers = max(1, n_workers)
         # 队列反压：maxsize控制预渲染量，避免撑爆内存
         # 满队列时put()自动阻塞→渲染线程等待→自然调节投喂速度
         print(f"[PDFProcessor] {n_workers} render threads, queue={render_queue.maxsize} (CPU={cpu_cores}, dual={num_consumers>1})")
@@ -1270,13 +1337,18 @@ class PDFProcessor:
             })
             try:
                 if total_pages <= 2000:
-                    output_pdf.subset_fonts()
+                    # output_pdf.subset_fonts()  [REMOVED: causes CJK character loss]
                     output_pdf.save(output_pdf_path, deflate=True, garbage=3)
                 else:
                     output_pdf.save(output_pdf_path, deflate=True, garbage=1)
-            except:
-                output_pdf.save(output_pdf_path)
-            output_pdf.close()
+            except Exception as e:
+                print(f"[PDFProcessor] Save failed: {e}, retrying with no options...")
+                try:
+                    output_pdf.save(output_pdf_path)
+                except Exception as e2:
+                    print(f"[PDFProcessor] Retry also failed: {e2}")
+            finally:
+                output_pdf.close()
         print(f"[PDFProcessor] Done: {output_pdf_path}, TXT: {txt_path}")
         return output_pdf_path, txt_path
 
