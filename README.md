@@ -340,27 +340,37 @@ graph TD
 | 下载方式 | 链接 |
 |:-------|:-----|
 | ⭐ **GitHub**（推荐国际用户） | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.2) |
-| 📦 **中国移动云盘**（推荐国内用户） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGRM3Ugv668) |
-| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1gOnx5RE21N_lfLryxtKsxw?pwd=2026) |
+| 📦 **中国移动云盘**（推荐国内用户） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGUzgcebid5) |
+| 📦 **百度网盘**（备用，密码 2026） | 待补充 |
 
 #### ② Pro 专业版（~5.8 GB）
 需要识别阿拉伯文、天城文等稀有语言，或需要多引擎对比时选这个。
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **中国移动云盘**（推荐） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGqg9P7qKcd) |
-| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1EQ_GJjYNmoDWJljWZ3y3pw?pwd=2026) |
+| 📦 **中国移动云盘**（推荐） | 待补充 |
+| 📦 **百度网盘**（备用，密码 2026） | 待补充 |
 
 #### ③ DEV 开发版（~10 GB）
 如果你想研究或修改代码，选这个（含全套源码和开发工具）。
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **百度网盘**（密码 2026） | [点击下载](https://pan.baidu.com/s/1ym1MBo65ceHwJgoa2iSKeg?pwd=2026) |
+| 📦 **百度网盘**（密码 2026） | 待补充 |
 
 ---
 
-### 📦 旧版本（v1.0.0）
+### 📦 旧版本
+
+#### v1.1.0
+
+| 版本 | 百度网盘 | GitHub |
+|------|----------|--------|
+| **Lite 轻量版** | [下载](https://pan.baidu.com/s/1gOnx5RE21N_lfLryxtKsxw?pwd=2026) | [v1.1.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) |
+| **Pro 专业版** | [下载](https://pan.baidu.com/s/1EQ_GJjYNmoDWJljWZ3y3pw?pwd=2026) | [v1.1.0-pro](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0-pro) |
+| **Dev 开发版** | [下载](https://pan.baidu.com/s/1ym1MBo65ceHwJgoa2iSKeg?pwd=2026) | [v1.1.0-dev](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0-dev) |
+
+#### v1.0.0
 
 | 版本 | 百度网盘 | GitHub |
 |------|----------|--------|
