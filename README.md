@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 # 🏛️ CathayOCR
 
@@ -19,12 +19,12 @@
 
 </div>
 
-> ⚠️ **如果你已经下载了 v1.0.0 版本并发现以下问题，请一定更新到 v1.1.0：**
+> ⚠️ **如果你已经下载了 v1.0.0 版本并发现以下问题，请一定更新到 v1.1.2：**
 >
 > 🐛 **PDF 导出缺字/识字不全** — 中文、日文、韩文等字符在导出的 PDF 中"消失"了？已修复 ✅
 > 🐛 **启动闪退/打不开** — 双击图标闪一下就关闭？已修复 ✅
 >
-> ⬇️ [点击这里直接下载 v1.1.0](#-安装包下载)（保留旧版本下载链接，放心下载）
+> ⬇️ [点击这里直接下载 v1.1.2](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.2)（保留旧版本下载链接，放心下载）
 ---
 ## 🔗 Cathay 人文研究工具链
 
@@ -32,7 +32,7 @@
 
 | 步骤 | 工具 | 功能 | 状态 |
 |:----:|:----|:----|:----:|
-| ① | **⭐ CathayOCR (你在这里)** | 📄 多引擎 GPU 加速古籍 PDF 批处理 OCR | ✅ v1.1.0 |
+| ① | **⭐ CathayOCR (你在这里)** | 📄 多引擎 GPU 加速古籍 PDF 批处理 OCR | ✅ v1.1.2 |
 | ② | [**CathaySimplify** →](https://github.com/zzhjim02/CathaySimplify) | 🔄 TXT 繁简体批量双向转换 · 编码智能适配 | ✅ v1.0.0 |
 | ③ | [**CathayReader** →](https://github.com/zzhjim02/CathayReader) | 📖 PDF/TXT 双栏同步古籍校勘阅读器 | ✅ v1.0.0 |
 
@@ -332,14 +332,14 @@ graph TD
 
 ---
 
-### 🚀 推荐下载（最新版 v1.1.0）
+### 🚀 推荐下载（最新版 v1.1.2）
 
 #### ① Lite 轻量版（~640 MB）← 大多数人选这个！
 适合识别中文、日文、韩文等常见语言，开箱即用。
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| ⭐ **GitHub**（推荐国际用户） | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) |
+| ⭐ **GitHub**（推荐国际用户） | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.2) |
 | 📦 **中国移动云盘**（推荐国内用户） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGRM3Ugv668) |
 | 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1gOnx5RE21N_lfLryxtKsxw?pwd=2026) |
 
@@ -400,5 +400,6 @@ Umi-OCR 更适合单张图片或少量文字的屏幕识别。CathayOCR 是专�
 </details>
 
 ---
+
 
 
