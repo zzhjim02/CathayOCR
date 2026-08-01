@@ -1,4 +1,4 @@
-﻿"""
+"""
 CathayOCR Dev v1.0 - 多引擎GPU加速PDF处理器
 Architecture: 预渲染所有页面到RAM -> 单实例OCR流水线 -> 组装输出
 核心思想: GPU永不等待,CPU预渲染消除I/O瓶颈
@@ -26,6 +26,19 @@ from queue import Queue, Empty, Full
 from abc import ABC, abstractmethod
 import socket
 import tempfile
+
+# Fix Qt platform plugin path for portable Python
+try:
+    import PyQt5
+    _pyqt_dir = os.path.dirname(PyQt5.__file__)
+    _qt_bin = os.path.join(_pyqt_dir, 'Qt5', 'bin')
+    _qt_plugins = os.path.join(_pyqt_dir, 'Qt5', 'plugins', 'platforms')
+    if os.path.isdir(_qt_bin):
+        os.environ['PATH'] = _qt_bin + os.pathsep + os.environ.get('PATH', '')
+    if os.path.isdir(_qt_plugins):
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = _qt_plugins
+except Exception:
+    pass
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1300,7 +1313,6 @@ class PDFProcessor:
         self.completed_count = 0
         self._total_done = 0
         self._start_time = 0
-        self.completed_count = 0
 
     @property
     def is_paused(self):
@@ -1386,7 +1398,7 @@ class PDFProcessor:
             t0 = time.time()
             while my_done < total_pages and not self._cancelled:
                 try:
-                    pn, b64_data = render_queue.get(timeout=2)
+                    pn, b64_data = render_queue.get(timeout=0.3)
                 except Empty:
                     if all_done.is_set():
                         break
@@ -1515,13 +1527,17 @@ class PDFProcessor:
             })
             try:
                 if total_pages <= 2000:
-                    output_pdf.subset_fonts()
                     output_pdf.save(output_pdf_path, deflate=True, garbage=3)
                 else:
                     output_pdf.save(output_pdf_path, deflate=True, garbage=1)
-            except:
-                output_pdf.save(output_pdf_path)
-            output_pdf.close()
+            except Exception as e:
+                print(f"[PDFProcessor] Save failed: {e}, retrying with no options...")
+                try:
+                    output_pdf.save(output_pdf_path)
+                except Exception as e2:
+                    print(f"[PDFProcessor] Retry also failed: {e2}")
+            finally:
+                output_pdf.close()
         print(f"[PDFProcessor] Done: {output_pdf_path}, TXT: {txt_path}")
         return output_pdf_path, txt_path
 
@@ -2495,29 +2511,28 @@ class MainWindow(QMainWindow):
         else:  # 纯CPU
             target_engine = "ncnn_cpu"
 
-        # ── 语言兼容性检查：V5语系语言 ──
+        # ── 语言兼容性检查：部分语系仅 PP-OCRv5 或 EasyOCR 支持 ──
         lang_text = self.simple_lang.currentText()
+        # PP-OCRv6/ncnn V6 内嵌字典仅覆盖拉丁/CJK/韩/西里尔
         # v5-only 语系：阿拉伯/天城文/泰文/希腊文/泰卢固/泰米尔 + 多语言(v5)
-        # 这些语言需要 PP-OCRv5 ONNX 模型，umi_plugin_v6 内部已支持路由
         _V5_CODES = {"ar", "fa", "ug", "ur", "hi", "mr", "ne", "sa",
                         "th", "el", "te", "ta", "multilang_v5"}
         _V5_ONLY = {item[0] for item in self._LANG_ITEMS if item[1] in _V5_CODES}
         if lang_text in _V5_ONLY:
-            # V5语系语言：umi_plugin_v6 内部已支持路由到 PP-OCRv5 ONNX
+            # v5-only 语言需要 PP-OCRv5 ONNX 多语言模型支持
+            # ⚠ win7_v5（PP-OCRv5 Paddle CPU）是纯中文引擎（keys 仅含汉字+拉丁字符）
+            #   无法识别天城文/阿拉伯文/泰文/希腊文/泰卢固/泰米尔等语言
+            # ✅ umi_plugin_v6（PP-OCRv6 ONNX CUDA/CPU）内置 v5 ONNX 多语言回退，
+            #   ppocr_v6_server.py 中 _V5_LANGS 已定义完整支持列表
             v6_idx = self.engine_combo.findData("umi_plugin_v6")
             if v6_idx >= 0:
                 target_engine = "umi_plugin_v6"
             else:
-                # umi_plugin_v6 不可用时降级到 win7_v5 / ncnn
-                v5_idx = self.engine_combo.findData("win7_v5")
-                if v5_idx >= 0:
-                    target_engine = "win7_v5"
+                v5_fallback = self.engine_combo.findData("ncnn_vulkan")
+                if v5_fallback >= 0:
+                    target_engine = "ncnn_vulkan"
                 else:
-                    vk_idx = self.engine_combo.findData("ncnn_vulkan")
-                    if vk_idx >= 0:
-                        target_engine = "ncnn_vulkan"
-                    else:
-                        target_engine = "ncnn_cpu"
+                    target_engine = "ncnn_cpu"
 
         idx = self.engine_combo.findData(target_engine)
         if idx >= 0:
