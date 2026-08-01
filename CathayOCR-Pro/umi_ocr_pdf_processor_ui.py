@@ -27,6 +27,19 @@ from abc import ABC, abstractmethod
 import socket
 import tempfile
 
+# Fix Qt platform plugin path for portable Python
+try:
+    import PyQt5
+    _pyqt_dir = os.path.dirname(PyQt5.__file__)
+    _qt_bin = os.path.join(_pyqt_dir, 'Qt5', 'bin')
+    _qt_plugins = os.path.join(_pyqt_dir, 'Qt5', 'plugins', 'platforms')
+    if os.path.isdir(_qt_bin):
+        os.environ['PATH'] = _qt_bin + os.pathsep + os.environ.get('PATH', '')
+    if os.path.isdir(_qt_plugins):
+        os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = _qt_plugins
+except Exception:
+    pass
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog,
@@ -1300,7 +1313,6 @@ class PDFProcessor:
         self.completed_count = 0
         self._total_done = 0
         self._start_time = 0
-        self.completed_count = 0
 
     @property
     def is_paused(self):
@@ -1386,7 +1398,7 @@ class PDFProcessor:
             t0 = time.time()
             while my_done < total_pages and not self._cancelled:
                 try:
-                    pn, b64_data = render_queue.get(timeout=2)
+                    pn, b64_data = render_queue.get(timeout=0.3)
                 except Empty:
                     if all_done.is_set():
                         break
@@ -1515,13 +1527,17 @@ class PDFProcessor:
             })
             try:
                 if total_pages <= 2000:
-                    output_pdf.subset_fonts()
                     output_pdf.save(output_pdf_path, deflate=True, garbage=3)
                 else:
                     output_pdf.save(output_pdf_path, deflate=True, garbage=1)
-            except:
-                output_pdf.save(output_pdf_path)
-            output_pdf.close()
+            except Exception as e:
+                print(f"[PDFProcessor] Save failed: {e}, retrying with no options...")
+                try:
+                    output_pdf.save(output_pdf_path)
+                except Exception as e2:
+                    print(f"[PDFProcessor] Retry also failed: {e2}")
+            finally:
+                output_pdf.close()
         print(f"[PDFProcessor] Done: {output_pdf_path}, TXT: {txt_path}")
         return output_pdf_path, txt_path
 
@@ -2503,15 +2519,12 @@ class MainWindow(QMainWindow):
                         "th", "el", "te", "ta", "multilang_v5"}
         _V5_ONLY = {item[0] for item in self._LANG_ITEMS if item[1] in _V5_CODES}
         if lang_text in _V5_ONLY:
-            # v5-only 语言需要 PP-OCRv5 ONNX 多语言模型
-            # win7_v5（PP-OCRv5 Paddle CPU）是纯中文引擎（keys 仅含汉字+拉丁字符）
-            # 无法识别天城文/阿拉伯文/泰文/希腊文/泰卢固/泰米尔等语言
-            # umi_plugin_v6（PP-OCRv6 ONNX CUDA/CPU）通过 engine=onnxruntime + model_name
-            # 从本地缓存加载 v5 ONNX 多语言模型，正确支持全部 V5 语系
-            v6_idx = self.engine_combo.findData("umi_plugin_v6")
-            if v6_idx >= 0:
-                target_engine = "umi_plugin_v6"
+            # v5-only 语言需要 PP-OCRv5 ONNX 引擎
+            v5_idx = self.engine_combo.findData("win7_v5")
+            if v5_idx >= 0:
+                target_engine = "win7_v5"
             else:
+                # win7_v5 不可用，降级为 ncnn
                 v5_fallback = self.engine_combo.findData("ncnn_vulkan")
                 if v5_fallback >= 0:
                     target_engine = "ncnn_vulkan"
