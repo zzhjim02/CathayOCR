@@ -1,4 +1,4 @@
-﻿<div align="center">
+﻿﻿<div align="center">
 
 # 🏛️ CathayOCR
 
@@ -356,19 +356,17 @@ graph TD
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **百度网盘**（密码 2026） | [点击下载](https://pan.baidu.com/s/1wtRRCphaUWg8whdgp2cwsA?pwd=2026) |
+| 📦 **百度网盘**（密码 2026） | [点击下载](https://pan.baidu.com/s/1ym1MBo65ceHwJgoa2iSKeg?pwd=2026) |
 
 ---
 
-### 📦 旧版本下载（v1.0.0）
+### 📦 旧版本（v1.0.0）
 
-> 如果你正在用旧版本且用得没问题，可以继续用。以下为原有下载链接：
-
-| 版本 | 下载 |
-|:----|:----|
-| **Lite 轻量版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) / [百度网盘](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026)（2026） |
-| **Pro 专业版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) / [百度网盘](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026)（2026） |
-| **DEV 开发版** v1.0.0 | [GitHub](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) / [百度网盘](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026)（2026） |
+| 版本 | 百度网盘 | GitHub |
+|------|----------|--------|
+| **Lite 轻量版** | [下载](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026) | [v1.0.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) |
+| **Pro 专业版** | [下载](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026) | [v1.0.0-pro](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) |
+| **Dev 开发版** | [下载](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026) | [v1.0.0-dev](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) |
 >
 <summary><b>进度不动了 / 卡住了？</b></summary>
 点击「停止」→ 关掉程序 → 重新打开。如果频繁卡住：① 检查任务管理器有无残留 OCR 进程；② 调低批处理数；③ 换 ncnn CPU 引擎。
@@ -400,6 +398,7 @@ Umi-OCR 更适合单张图片或少量文字的屏幕识别。CathayOCR 是专�
 </details>
 
 ---
+
 
 
 
