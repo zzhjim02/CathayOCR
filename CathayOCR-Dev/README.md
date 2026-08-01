@@ -425,7 +425,7 @@ A: 可以安全删除的是：
 
 ---
 
-## 更新历史\n\n| 版本 | 日期 | 说明 |\n|------|------|------|\n| **v1.1.2** | 2026-08-01 | 修复 3 个 Bug（文件句柄泄漏、consumer 超时过长等）|\n| v1.0.0 | 2026-07-?? | 正式版发布，多引擎支持 |\n\n---\n\n## 许可与致谢
+## 更新历史\n\n| 版本 | 日期 | 说明 |\n|------|------|------|\n| **v1.1.2** | 2026-08-01 | 修复 3 个 Bug（文件句柄泄漏、consumer 超时过长等）|\n| v1.0.0 | 2026-07 | 正式版发布，多引擎支持 |\n\n---\n\n## 许可与致谢
 
 - **许可证**：GPLv3
 - **上游项目**：[Umi-OCR](https://github.com/hiroi-sora/Umi-OCR) | [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) | [ncnn](https://github.com/Tencent/ncnn) | [ppocr-ncnn-cpp](https://github.com/CrumpetTurtle/ppocr-ncnn-cpp) | [PyMuPDF](https://github.com/pymupdf/PyMuPDF) | [PyQt5](https://riverbankcomputing.com/software/pyqt/)
