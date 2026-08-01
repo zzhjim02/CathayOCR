@@ -339,7 +339,7 @@ graph TD
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| ⭐ **GitHub**（推荐国际用户） | 待补充 |
+| ⭐ **GitHub**（推荐国际用户） | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.2) |
 | 📦 **中国移动云盘**（推荐国内用户） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGUzgcebid5) |
 | 📦 **百度网盘**（备用，密码 2026） | 待补充 |
 
@@ -367,16 +367,16 @@ graph TD
 | 版本 | 百度网盘 | GitHub |
 |------|----------|--------|
 | **Lite 轻量版** | [下载](https://pan.baidu.com/s/1gOnx5RE21N_lfLryxtKsxw?pwd=2026) | [v1.1.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) |
-| **Pro 专业版** | [下载](https://pan.baidu.com/s/1EQ_GJjYNmoDWJljWZ3y3pw?pwd=2026) | [v1.1.0-pro](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0-pro) |
-| **Dev 开发版** | [下载](https://pan.baidu.com/s/1ym1MBo65ceHwJgoa2iSKeg?pwd=2026) | [v1.1.0-dev](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0-dev) |
+| **Pro 专业版** | [下载](https://pan.baidu.com/s/1EQ_GJjYNmoDWJljWZ3y3pw?pwd=2026) | [v1.1.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) |
+| **Dev 开发版** | [下载](https://pan.baidu.com/s/1ym1MBo65ceHwJgoa2iSKeg?pwd=2026) | [v1.1.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.0) |
 
 #### v1.0.0
 
 | 版本 | 百度网盘 | GitHub |
 |------|----------|--------|
 | **Lite 轻量版** | [下载](https://pan.baidu.com/s/1T1qUGrG6Kq_Td1ASsWBCtw?pwd=2026) | [v1.0.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) |
-| **Pro 专业版** | [下载](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026) | [v1.0.0-pro](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-pro) |
-| **Dev 开发版** | [下载](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026) | [v1.0.0-dev](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0-dev) |
+| **Pro 专业版** | [下载](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026) | [v1.0.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) |
+| **Dev 开发版** | [下载](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026) | [v1.0.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) |
 >
 <summary><b>进度不动了 / 卡住了？</b></summary>
 点击「停止」→ 关掉程序 → 重新打开。如果频繁卡住：① 检查任务管理器有无残留 OCR 进程；② 调低批处理数；③ 换 ncnn CPU 引擎。
