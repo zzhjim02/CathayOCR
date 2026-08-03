@@ -361,6 +361,14 @@ graph TD
 
 ### 📦 旧版本
 
+#### v1.1.2
+
+| 版本 | 百度网盘 | GitHub |
+|------|----------|--------|
+| **Lite 轻量版** | [下载](https://pan.baidu.com/s/1dukKhUcOH-daLKxr9ZmFvg?pwd=2026) | [v1.1.2](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.2) |
+| **Pro 专业版** | [下载](https://pan.baidu.com/s/15kyLbXZfXdlRQyox4-ztig?pwd=2026) | [v1.1.2](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.2) |
+| **Dev 开发版** | [下载](https://pan.baidu.com/s/1B7sWYaQ-c3H3IQKl4UYWMw?pwd=2026) | [v1.1.2](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.1.2) |
+
 #### v1.1.0
 
 | 版本 | 百度网盘 | GitHub |
