@@ -347,8 +347,8 @@ graph TD
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **中国移动云盘**（推荐） | [正在上传](https://yun.139.com/shareweb/#/w/i/2wFGUjf5dH03d) |
-| 📦 **百度网盘**（备用，密码 2026） | [正在上传](https://pan.baidu.com/s/15kyLbXZfXdlRQyox4-ztig?pwd=2026) |
+| 📦 **中国移动云盘**（推荐） | [点击下载](https://yun.139.com/shareweb/#/w/i/2wFGUThxo22kp) |
+| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/165w3HUiuPF2DfogWJQh-Hg?pwd=2026) |
 
 #### ③ DEV 开发版（~10 GB）
 如果你想研究或修改代码，选这个（含全套源码和开发工具）。
