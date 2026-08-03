@@ -26,6 +26,7 @@ from queue import Queue, Empty, Full
 from abc import ABC, abstractmethod
 import socket
 import tempfile
+import collections
 
 # Fix Qt platform plugin path for portable Python
 try:
@@ -862,6 +863,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         self.lock = threading.Lock()
         self.current_config = {}
         self._started = False
+        self._ocr_times = collections.deque(maxlen=20)
 
     def set_port_offset(self, offset):
         """设置端口偏移，支持多实例并行"""
@@ -1070,8 +1072,12 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
             try:
+                t_ocr_start = time.time()
                 request = {"img_path": tmp_path.replace("\\", "/")}
-                return self._tcp_request(request, timeout)
+                result = self._tcp_request(request, timeout)
+                if result.get("code") == 100:
+                    self._ocr_times.append(time.time() - t_ocr_start)
+                return result
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -1097,6 +1103,34 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                     pass
             self.server_proc = None
         self._started = False
+
+    def get_dynamic_timeout(self, floor=180, ceiling=300):
+        all_times = list(self._ocr_times)
+        try:
+            client = OCRClient._instance
+            if client and hasattr(client, "_instances"):
+                for inst in client._instances:
+                    if inst is not self:
+                        all_times.extend(getattr(inst, "_ocr_times", []))
+        except Exception:
+            pass
+        if len(all_times) < 3:
+            return floor
+        sorted_times = sorted(all_times)
+        p90_idx = int(len(sorted_times) * 0.9)
+        p90 = sorted_times[p90_idx]
+        upgrade = p90 * 3
+        if upgrade <= floor:
+            return floor
+        return int(min(upgrade, ceiling))
+
+    def restart(self, params=None):
+        print(f"[NcnnAdapter] Restarting engine on port {self._server_port}...")
+        self.stop()
+        time.sleep(0.5)
+        if params is None:
+            params = self.current_config
+        return self.start(params)
 
     def close(self):
         self.stop()
@@ -1276,6 +1310,22 @@ class OCRClient:
         self._instances = []
         self._initialized = False
 
+    def restart_single(self, instance_idx):
+        instances = getattr(self, "_instances", [])
+        if instance_idx < len(instances):
+            try:
+                instances[instance_idx].restart()
+            except Exception as e:
+                print(f"[OCRClient] restart_single({instance_idx}) failed: {e}")
+
+    def restart_all(self):
+        instances = getattr(self, "_instances", [])
+        for i, a in enumerate(instances):
+            try:
+                a.restart()
+            except Exception as e:
+                print(f"[OCRClient] restart_all[{i}] failed: {e}")
+
     def close(self):
         for a in getattr(self, "_instances", []):
             try:
@@ -1405,10 +1455,52 @@ class PDFProcessor:
                     continue
                 if self._cancelled:
                     break
-                try:
-                    result = self.ocr.ocr_image_base64(b64_data, timeout_seconds=180)
-                except Exception as e:
-                    result = {"code": 900, "data": f"OCR error: {str(e)}"}
+                # === Watchdog recovery loop ===
+                result = None
+                for _wd_retry in range(4):
+                    if self._cancelled:
+                        break
+                    try:
+                        timeout_val = 180
+                        try:
+                            timeout_val = self.ocr._instances[0].get_dynamic_timeout()
+                        except Exception:
+                            pass
+                        result = self.ocr.ocr_image_base64(b64_data, timeout_seconds=timeout_val)
+                        if result.get("code") == 100:
+                            break
+                        print(f"[Watchdog] OCR-{consumer_id} code={result.get('code')}, retry={_wd_retry}")
+                        if _wd_retry == 0:
+                            print(f"[Watchdog] T1: restarting ALL engine instances")
+                            self.ocr.restart_all()
+                            time.sleep(0.5)
+                        elif _wd_retry == 1:
+                            print(f"[Watchdog] T2: restarting all instances...")
+                            self.ocr.restart_all()
+                            time.sleep(1)
+                        else:
+                            print(f"[Watchdog] T3: full file restart needed")
+                            self._need_restart = True
+                            break
+                    except Exception as e:
+                        result = {"code": 900, "data": f"OCR error: {str(e)}"}
+                        print(f"[Watchdog] OCR-{consumer_id} exception retry={_wd_retry}: {e}")
+                        if _wd_retry == 0:
+                            print(f"[Watchdog] T1: restarting ALL engine instances")
+                            self.ocr.restart_all()
+                            time.sleep(0.5)
+                        elif _wd_retry == 1:
+                            print(f"[Watchdog] T2: restarting all instances...")
+                            self.ocr.restart_all()
+                            time.sleep(1)
+                        else:
+                            print(f"[Watchdog] T3: full file restart needed")
+                            self._need_restart = True
+                            break
+                if self._need_restart:
+                    break
+                if result is None:
+                    result = {"code": 900, "data": "Watchdog exhausted"}
                 with self.results_lock:
                     self.results[pn] = result
                     done_pages[pn] = True
@@ -1430,40 +1522,58 @@ class PDFProcessor:
                     print(f"[合计] {total_done}/{total_pages} | {total_rate:.2f} p/s")
                 if progress_callback:
                     progress_callback(self._total_done, total_pages, next_to_store)
-        num_consumers = 2 if self.dual_instance else 1
-        render_queue = Queue(maxsize=20 if num_consumers > 1 else 12)
-        # 渲染线程数 ≈ CPU核数-消费者数，留足CPU给OCR进程
-        cpu_cores = os.cpu_count() or 8
-        n_workers = min(max(4, cpu_cores - num_consumers), total_pages, 32)
-        # 队列反压：maxsize控制预渲染量，避免撑爆内存
-        # 满队列时put()自动阻塞→渲染线程等待→自然调节投喂速度
-        print(f"[PDFProcessor] {n_workers} render threads, queue={render_queue.maxsize} (CPU={cpu_cores}, dual={num_consumers>1})")
-        workers_per_thread = (total_pages + n_workers - 1) // n_workers
-        producers = []
-        self._num_workers = 0
-        for i in range(n_workers):
-            start = i * workers_per_thread
-            end = min(start + workers_per_thread, total_pages)
-            if start >= total_pages:
-                break
-            t = threading.Thread(target=render_worker, args=(start, end))
-            t.daemon = True
-            t.start()
-            producers.append(t)
-            self._num_workers += 1
-        self._start_time = time.time()
-        print(f"[PDFProcessor] Starting: {self._num_workers} render threads + {num_consumers} OCR consumers")
-        consumers = []
-        for i in range(num_consumers):
-            c = threading.Thread(target=ocr_consumer, args=(i + 1,))
-            c.daemon = True
-            c.start()
-            consumers.append(c)
-        for c in consumers:
-            c.join()
-        for t in producers:
-            t.join()
-        if self._cancelled:
+        self._need_restart = False
+        for _full_retry in range(2):
+            num_consumers = 2 if self.dual_instance else 1
+            render_queue = Queue(maxsize=20 if num_consumers > 1 else 12)
+            # 渲染线程数 ≈ CPU核数-消费者数，留足CPU给OCR进程
+            cpu_cores = os.cpu_count() or 8
+            n_workers = min(max(4, cpu_cores - num_consumers), total_pages, 32)
+            # 队列反压：maxsize控制预渲染量，避免撑爆内存
+            # 满队列时put()自动阻塞→渲染线程等待→自然调节投喂速度
+            print(f"[PDFProcessor] {n_workers} render threads, queue={render_queue.maxsize} (CPU={cpu_cores}, dual={num_consumers>1})")
+            workers_per_thread = (total_pages + n_workers - 1) // n_workers
+            producers = []
+            self._num_workers = 0
+            for i in range(n_workers):
+                start = i * workers_per_thread
+                end = min(start + workers_per_thread, total_pages)
+                if start >= total_pages:
+                    break
+                t = threading.Thread(target=render_worker, args=(start, end))
+                t.daemon = True
+                t.start()
+                producers.append(t)
+                self._num_workers += 1
+            self._start_time = time.time()
+            print(f"[PDFProcessor] Starting: {self._num_workers} render threads + {num_consumers} OCR consumers")
+            consumers = []
+            for i in range(num_consumers):
+                c = threading.Thread(target=ocr_consumer, args=(i + 1,))
+                c.daemon = True
+                c.start()
+                consumers.append(c)
+            for c in consumers:
+                c.join()
+            for t in producers:
+                t.join()
+            if self._need_restart and _full_retry == 0:
+                print("[Watchdog] Full file restart triggered...")
+                self._cancelled = True
+                self.ocr.force_close()
+                time.sleep(2)
+                self.ocr.restart_all()
+                self._cancelled = False
+                self.results = {}
+                self.completed_count = 0
+                self._total_done = 0
+                self._need_restart = False
+                continue
+            break
+        if self._cancelled and not self._need_restart:
+            return None, None
+        if self._need_restart:
+            print("[Watchdog] ERROR: Full file restart also failed.")
             return None, None
         return self.write_results(input_path, output_dir, total_pages, scale)
 
