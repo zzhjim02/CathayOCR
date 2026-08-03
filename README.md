@@ -407,7 +407,7 @@ graph TD
 
 <details>
 <summary><b>和 Umi-OCR 有什么区别？</b></summary>
-Umi-OCR 更适合单张图片或少量文字的屏幕识别。CathayOCR 是专为<b>大量 PDF 文件批量处理</b>设计的，多了自动流水线、双实例并行加速、GPU 设备选择、简单模式等功能，批处理效率高得多。
+Umi-OCR 更适合单张图片或少量文字的屏幕识别，在处理大文件时，会一次性将所有PDF页面导入内存，运行效率较低。CathayOCR 是专为<b>大量 PDF 文件批量处理</b>设计的，多了自动流水线、双实例并行加速、GPU 设备选择、简单模式等功能，批处理效率高得多。
 </details>
 
 <details>
