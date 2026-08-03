@@ -385,6 +385,7 @@ graph TD
 | **Pro 专业版** | [下载](https://pan.baidu.com/s/14K95tkJOzzopbjuGy0290Q?pwd=2026) | [v1.0.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) |
 | **Dev 开发版** | [下载](https://pan.baidu.com/s/1WDZXVVl9zld07fh_JCeVDA?pwd=2026) | [v1.0.0](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.0.0) |
 >
+<details>
 <summary><b>进度不动了 / 卡住了？</b></summary>
 点击「停止」→ 关掉程序 → 重新打开。如果频繁卡住：① 检查任务管理器有无残留 OCR 进程；② 调低批处理数；③ 换 ncnn CPU 引擎。
 </details>
