@@ -1,5 +1,5 @@
 """
-CathayOCR Lite (CathayOCR极速版) v1.0 - 纯 Vulkan 引擎PDF处理器
+CathayOCR Lite (CathayOCR极速版) v1.2.3 - 纯 Vulkan 引擎PDF处理器
 Architecture: 预渲染所有页面到RAM -> 单实例OCR流水线 -> 组装输出
 核心思想: GPU永不等待,CPU预渲染消除I/O瓶颈
 =======================================================
@@ -22,6 +22,7 @@ from queue import Queue, Empty, Full
 from abc import ABC, abstractmethod
 import socket
 import tempfile
+import collections
 
 # Fix Qt platform plugin path for portable Python
 try:
@@ -559,6 +560,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         self.current_config = {}
         self._started = False
         self._use_gpu = True  # 默认为GPU模式
+        self._ocr_times = collections.deque(maxlen=20)  # 最近OCR耗时(秒)，用于自适应超时
 
     def set_port_offset(self, offset):
         """设置端口偏移，支持多实例并行"""
@@ -887,11 +889,16 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                     tmp.write(img_bytes)
                     tmp_path = tmp.name
             try:
+                t_ocr_start = time.time()
                 if self._use_gpu:
                     request = {"img_path": tmp_path.replace("\\", "/")}
-                    return self._tcp_request(request, timeout)
+                    result = self._tcp_request(request, timeout)
                 else:
-                    return self._run_exe(tmp_path, timeout)
+                    result = self._run_exe(tmp_path, timeout)
+                elapsed = time.time() - t_ocr_start
+                if result.get("code") == 100:
+                    self._ocr_times.append(elapsed)
+                return result
             finally:
                 # 非复用回退路径仍需清理
                 if not self._tmp_path:
@@ -932,6 +939,46 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                 self.server_proc = None
             self._started = False
         # CPU模式：单次子进程已结束，无操作
+
+    def get_dynamic_timeout(self, floor=180, ceiling=300):
+        """根据所有活跃引擎实例的历史OCR耗时计算动态超时
+        - 默认 180s（与原始版本一致，不额外多等）
+        - 如果检测到本地处理速度慢（p90×3 > 180s），自动升到 min(p90×3, 300s)
+        - 前3页无历史数据时用 180s
+        - 查询时合并所有同类型适配器的 _ocr_times（多实例共享统计）
+        """
+        # 尝试从 OCRClient 聚合所有实例的计时
+        all_times = list(self._ocr_times)
+        # 查找 OCRClient 单例，聚合其他实例的计时
+        from types import ModuleType
+        try:
+            client = OCRClient._instance
+            if client and hasattr(client, "_instances"):
+                for inst in client._instances:
+                    if inst is not self:
+                        all_times.extend(getattr(inst, "_ocr_times", []))
+        except Exception:
+            pass
+        if len(all_times) < 3:
+            return floor
+        sorted_times = sorted(all_times)
+        p90_idx = int(len(sorted_times) * 0.9)
+        p90 = sorted_times[p90_idx]
+        upgrade = p90 * 3
+        if upgrade <= floor:
+            return floor  # 设备正常，用默认 180s
+        return int(min(upgrade, ceiling))  # 设备慢，自动升到 300s
+
+    def restart(self, params=None):
+        """强制重启引擎进程（杀旧进程→重建新进程）
+        用于从Vulkan假死中恢复，不改变config。
+        """
+        print(f"[NcnnAdapter] Restarting engine on port {self._server_port}...")
+        self.stop()
+        time.sleep(0.5)  # 等操作系统释放端口
+        if params is None:
+            params = self.current_config
+        return self.start(params)
 
     def close(self):
         self.stop()
@@ -1053,6 +1100,24 @@ class OCRClient:
         self._instances = []
         self._initialized = False
 
+    def restart_single(self, instance_idx):
+        """重启单个引擎实例（用于看门狗Tier1恢复）"""
+        instances = getattr(self, "_instances", [])
+        if instance_idx < len(instances):
+            try:
+                instances[instance_idx].restart()
+            except Exception as e:
+                print(f"[OCRClient] restart_single({instance_idx}) failed: {e}")
+
+    def restart_all(self):
+        """重启全部引擎实例（用于看门狗Tier2恢复）"""
+        instances = getattr(self, "_instances", [])
+        for i, a in enumerate(instances):
+            try:
+                a.restart()
+            except Exception as e:
+                print(f"[OCRClient] restart_all[{i}] failed: {e}")
+
     def close(self):
         for a in getattr(self, "_instances", []):
             try:
@@ -1141,7 +1206,7 @@ class PDFProcessor:
         return pix.tobytes("png")
 
     def process_pdf(self, input_path, output_dir, total_pages, scale=2.0,
-                    progress_callback=None):
+                    progress_callback=None, vertical_sort=False, overwrite_ocr=False):
         """处理单个PDF文件。output_dir=None时输出到源文件所在目录"""
         if output_dir is None:
             output_dir = os.path.dirname(input_path)
@@ -1197,6 +1262,9 @@ class PDFProcessor:
             done_pages = [False] * total_pages
             next_to_store = 0
             t0 = time.time()
+            # 看门狗状态（per-consumer，复位周期=每页）
+            _tier1_fired = False  # T1: 重启全部引擎（直接重启所有，不猜轮询映射）
+            _tier2_fired = False  # T2: 触发全文件重启（清空结果、重建引擎、从头跑）
             while my_done < total_pages and not self._cancelled:
                 try:
                     pn, b64_data = render_queue.get(timeout=0.3)
@@ -1206,78 +1274,140 @@ class PDFProcessor:
                     continue
                 if self._cancelled:
                     break
-                try:
-                    result = self.ocr.ocr_image_base64(b64_data, timeout_seconds=180)
-                except Exception as e:
-                    result = {"code": 900, "data": f"OCR error: {str(e)}"}
-                with self.results_lock:
-                    self.results[pn] = result
-                    done_pages[pn] = True
-                    while next_to_store < total_pages and done_pages[next_to_store]:
-                        next_to_store += 1
-                my_done += 1
-                with self.completed_lock:
-                    self._total_done += 1
-                if my_done % 10 == 0:
-                    elapsed = time.time() - t0
-                    rate = my_done / elapsed if elapsed > 0 else 0
-                    print(f"[OCR-{consumer_id}] +{my_done} ({rate:.2f} p/s)")
-                # 合计每10页打一次（只有consumer-1打）
-                with self.completed_lock:
-                    total_done = self._total_done
-                if consumer_id == 1 and total_done % 10 == 0 and total_done > 0:
-                    total_time = time.time() - self._start_time
-                    total_rate = total_done / total_time if total_time > 0 else 0
-                    print(f"[合计] {total_done}/{total_pages} | {total_rate:.2f} p/s")
-                if progress_callback:
-                    progress_callback(self._total_done, total_pages, next_to_store)
-        num_consumers = 2 if self.dual_instance else 1
-        render_queue = Queue(maxsize=20 if num_consumers > 1 else 12)
-        # 渲染线程数：渲染能力(20~50页/秒)远大于OCR消化能力(1~4页/秒)，
-        # 线程数永远不会成为瓶颈；过多线程反而与OCR进程抢CPU导致GPU空转。
-        # 按文件规模动态调整：小文件少线程（省线程开销），大文件取平衡值。
-        cpu_cores = os.cpu_count() or 8
-        if total_pages <= 30:
-            # 小文件：2线程渲染足够（全部渲染完也只需1~3秒，而OCR要几十秒）
-            n_workers = min(2, total_pages)
-        else:
-            # 大文件：自适应渲染线程数（CPU核心数 - 消费实例数），最多32
-            n_workers = min(max(4, cpu_cores - num_consumers), total_pages, 32)
-            n_workers = min(n_workers, total_pages)
-        n_workers = max(1, n_workers)
-        # 队列反压：maxsize控制预渲染量，避免撑爆内存
-        # 满队列时put()自动阻塞→渲染线程等待→自然调节投喂速度
-        print(f"[PDFProcessor] {n_workers} render threads, queue={render_queue.maxsize} (CPU={cpu_cores}, dual={num_consumers>1})")
-        workers_per_thread = (total_pages + n_workers - 1) // n_workers
-        producers = []
-        self._num_workers = 0
-        for i in range(n_workers):
-            start = i * workers_per_thread
-            end = min(start + workers_per_thread, total_pages)
-            if start >= total_pages:
-                break
-            t = threading.Thread(target=render_worker, args=(start, end))
-            t.daemon = True
-            t.start()
-            producers.append(t)
-            self._num_workers += 1
-        self._start_time = time.time()
-        print(f"[PDFProcessor] Starting: {self._num_workers} render threads + {num_consumers} OCR consumers")
-        consumers = []
-        for i in range(num_consumers):
-            c = threading.Thread(target=ocr_consumer, args=(i + 1,))
-            c.daemon = True
-            c.start()
-            consumers.append(c)
-        for c in consumers:
-            c.join()
-        for t in producers:
-            t.join()
-        if self._cancelled:
+                # 每页开始时重置看门狗标志
+                _tier1_fired = False
+                _tier2_fired = False
+                # 看门狗恢复循环：同一页最多重试到 T3（触发全文件重启）
+                while True:
+                    # 动态超时：取实例0的 get_dynamic_timeout（已聚合所有活跃引擎的耗时）
+                    timeout_sec = self.ocr._instances[0].get_dynamic_timeout()
+                    t_page = time.time()
+                    try:
+                        result = self.ocr.ocr_image_base64(b64_data, timeout_seconds=timeout_sec)
+                    except Exception as e:
+                        result = {"code": 900, "data": f"OCR error: {str(e)}"}
+                    # 检测超时（引擎假死：code=102 + "timeout"）
+                    if result.get("code") == 102 and "timeout" in str(result.get("data", "")).lower():
+                        elapsed = time.time() - t_page
+                        print(f"[Watchdog] Consumer-{consumer_id} Page {pn} timeout after {elapsed:.0f}s (limit={timeout_sec}s)")
+                        if not _tier1_fired:
+                            # Tier 1: 重启全部引擎实例（避免轮询映射错位）
+                            _tier1_fired = True
+                            print(f"[Watchdog] Tier1: restarting ALL engine instances")
+                            self.ocr.restart_all()
+                            continue
+                        elif not _tier2_fired:
+                            # Tier 2: 触发全文件重启（引擎重启无效，说明是页面级别问题）
+                            _tier2_fired = True
+                            print(f"[Watchdog] Tier2: all engine restarts failed → full file restart")
+                            self._need_restart = True
+                            self._cancelled = True
+                            self.ocr.force_close()
+                            return
+                        else:
+                            # 不应到达，防御性处理
+                            print(f"[Watchdog] Tier3: unreachable, aborting")
+                            self._need_restart = True
+                            self._cancelled = True
+                            self.ocr.force_close()
+                            return
+                    # 非超时结果（成功 code=100 或 engine error）→ 退出看门狗循环
+                    break
+                # 正常/超时恢复成功：存结果
+                if not self._need_restart and not self._cancelled:
+                    with self.results_lock:
+                        self.results[pn] = result
+                        done_pages[pn] = True
+                        while next_to_store < total_pages and done_pages[next_to_store]:
+                            next_to_store += 1
+                    my_done += 1
+                    with self.completed_lock:
+                        self._total_done += 1
+                    if my_done % 10 == 0:
+                        elapsed = time.time() - t0
+                        rate = my_done / elapsed if elapsed > 0 else 0
+                        print(f"[OCR-{consumer_id}] +{my_done} ({rate:.2f} p/s)")
+                    # 合计每10页打一次（只有consumer-1打）
+                    with self.completed_lock:
+                        total_done = self._total_done
+                    if consumer_id == 1 and total_done % 10 == 0 and total_done > 0:
+                        total_time = time.time() - self._start_time
+                        total_rate = total_done / total_time if total_time > 0 else 0
+                        print(f"[合计] {total_done}/{total_pages} | {total_rate:.2f} p/s")
+                    if progress_callback:
+                        progress_callback(self._total_done, total_pages, next_to_store)
+                else:
+                    break
+        # 全文件重启外层循环（最多1次）
+        self._need_restart = False
+        for _full_retry in range(2):
+            num_consumers = 2 if self.dual_instance else 1
+            render_queue = Queue(maxsize=20 if num_consumers > 1 else 12)
+            # 渲染线程数：渲染能力(20~50页/秒)远大于OCR消化能力(1~4页/秒)，
+            # 线程数永远不会成为瓶颈；过多线程反而与OCR进程抢CPU导致GPU空转。
+            # 按文件规模动态调整：小文件少线程（省线程开销），大文件取平衡值。
+            cpu_cores = os.cpu_count() or 8
+            if total_pages <= 30:
+                # 小文件：2线程渲染足够（全部渲染完也只需1~3秒，而OCR要几十秒）
+                n_workers = min(2, total_pages)
+            else:
+                # 大文件：自适应渲染线程数（CPU核心数 - 消费实例数），最多32
+                n_workers = min(max(4, cpu_cores - num_consumers), total_pages, 32)
+                n_workers = min(n_workers, total_pages)
+            n_workers = max(1, n_workers)
+            # 队列反压：maxsize控制预渲染量，避免撑爆内存
+            # 满队列时put()自动阻塞→渲染线程等待→自然调节投喂速度
+            print(f"[PDFProcessor] {n_workers} render threads, queue={render_queue.maxsize} (CPU={cpu_cores}, dual={num_consumers>1})")
+            workers_per_thread = (total_pages + n_workers - 1) // n_workers
+            producers = []
+            self._num_workers = 0
+            for i in range(n_workers):
+                start = i * workers_per_thread
+                end = min(start + workers_per_thread, total_pages)
+                if start >= total_pages:
+                    break
+                t = threading.Thread(target=render_worker, args=(start, end))
+                t.daemon = True
+                t.start()
+                producers.append(t)
+                self._num_workers += 1
+            self._start_time = time.time()
+            print(f"[PDFProcessor] Starting: {self._num_workers} render threads + {num_consumers} OCR consumers")
+            consumers = []
+            for i in range(num_consumers):
+                c = threading.Thread(target=ocr_consumer, args=(i + 1,))
+                c.daemon = True
+                c.start()
+                consumers.append(c)
+            for c in consumers:
+                c.join()
+            for t in producers:
+                t.join()
+            if self._need_restart and _full_retry == 0:
+                print(f"[Watchdog] Full file restart #{_full_retry+1} triggered. Cleaning up...")
+                self._cancelled = True
+                self.ocr.force_close()
+                time.sleep(2)  # 等所有线程感知到 cancelled
+                # 重建引擎
+                print(f"[Watchdog] Rebuilding all engines for restart...")
+                self.ocr.restart_all()
+                self._cancelled = False
+                self.results = {}
+                self.completed_count = 0
+                self._total_done = 0
+                self._need_restart = False
+                continue
+            break
+        if self._cancelled and not self._need_restart:
             return None, None
-        return self.write_results(input_path, output_dir, total_pages, scale)
+        if self._need_restart:
+            print("[Watchdog] ERROR: Full file restart also failed. Aborting.")
+            return None, None
+        return self.write_results(input_path, output_dir, total_pages, scale, vertical_sort=vertical_sort,
+                                  overwrite_ocr=overwrite_ocr)
 
-    def write_results(self, input_path, output_dir, total_pages, scale):
+    def write_results(self, input_path, output_dir, total_pages, scale, vertical_sort=False,
+                     overwrite_ocr=False):
         input_name = Path(input_path).stem
         txt_path = os.path.join(output_dir, f"{input_name}_result.txt")
         et = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1291,12 +1421,28 @@ class PDFProcessor:
             txt_file.write("=" * 60 + "\n\n")
             with _suppress_mupdf_warnings():
                 output_pdf = fitz.open(input_path)
+            # 覆盖旧OCR：物理删除旧文字层（修订Redaction），完整保留图像与矢量图形
+            if overwrite_ocr:
+                for _p in output_pdf:
+                    _p.add_redact_annot(_p.rect)   # 标记整页区域
+                    _p.apply_redactions(
+                        images=fitz.PDF_REDACT_IMAGE_NONE,      # 严禁删除图像
+                        graphics=fitz.PDF_REDACT_LINE_ART_NONE  # 保留矢量图形
+                    )
             output_page_count = 0
             for page_num in sorted(self.results.keys()):
                 result = self.results[page_num]
                 if result.get("code") != 100:
                     continue
                 text_blocks = result.get("data", [])
+                # 竖排排序：当勾选"竖排识别"时，按中心点X降序（右→左）再Y升序（上→下）
+                if vertical_sort and text_blocks:
+                    def _vertical_key(tb):
+                        box = tb.get("box", [[0,0],[0,0],[0,0],[0,0]])
+                        cx = (box[0][0] + box[2][0]) / 2
+                        cy = (box[0][1] + box[2][1]) / 2
+                        return (-cx, cy)  # X降序, Y升序
+                    text_blocks = sorted(text_blocks, key=_vertical_key)
                 page_text_lines = []
                 output_page = output_pdf[page_num]
                 output_page.clean_contents()
@@ -1308,18 +1454,34 @@ class PDFProcessor:
                         continue
                     page_text_lines.append(text)
                     box = tb.get("box", [[0,0],[0,0],[0,0],[0,0]])
+                    # OCR引擎返回的是渲染图像像素坐标（图像=页面xscale），
+                    # 写入PDF前必须除以scale换算为PDF坐标，否则文字落在页面外无法提取/搜索
                     x0, y0 = box[0]
                     x2, y2 = box[2]
+                    x0 /= scale
+                    y0 /= scale
+                    x2 /= scale
+                    y2 /= scale
                     w = x2 - x0
                     h = y2 - y0
+                    # 竖排判定：勾选"竖排识别"且OCR框高>宽（竖条）时文字竖排写入，
+                    # 否则横排展开会超出页面（长句右侧文字落页外，查看器搜不到）。
+                    # 未勾选"竖排识别"时保持旧版横排行为。
+                    is_vertical_block = vertical_sort and h > w
                     fontsize = self.calculate_font_size(text, w, h)
-                    point = fitz.Point(x0, y2) * output_page.derotation_matrix
+                    if is_vertical_block:
+                        # 竖排：从框顶向下排（rotate=270），整句不溢出页面
+                        point = fitz.Point(x0, y0) * output_page.derotation_matrix
+                        rotate = 270
+                    else:
+                        point = fitz.Point(x0, y2) * output_page.derotation_matrix
+                        rotate = page_rotation
                     if not is_insert_font:
                         output_page.insert_font(fontname="cjk", fontbuffer=self.font.buffer)
                         is_insert_font = True
                     output_page.insert_text(
                         point, text, fontsize=fontsize, fontname="cjk",
-                        rotate=page_rotation, stroke_opacity=0, fill_opacity=0
+                        rotate=rotate, stroke_opacity=0, fill_opacity=0
                     )
                 if page_text_lines:
                     txt_file.write("\n" + "=" * 60 + "\n")
@@ -1367,7 +1529,8 @@ class BatchWorkerThread(QThread):
                  engine_id="ncnn_vulkan", use_gpu=True,
                  vertical_text=True, limit_side_len=2000,
                  model_size="medium", use_angle_cls=False,
-                 scale=2.0, dual_instance=True, extra_params=None):
+                 scale=2.0, dual_instance=True, extra_params=None,
+                 overwrite_ocr=False):
         super().__init__()
         self.file_list = file_list
         self.output_dir = output_dir
@@ -1380,6 +1543,7 @@ class BatchWorkerThread(QThread):
         self.scale = scale
         self.dual_instance = dual_instance
         self.extra_params = extra_params or {}
+        self.overwrite_ocr = overwrite_ocr
         self.is_cancelled = False
         self.is_paused = False
         self.processor = None
@@ -1418,6 +1582,8 @@ class BatchWorkerThread(QThread):
                     result = self.processor.process_pdf(
                         input_path, self.output_dir, total_pages,
                         scale=self.scale,
+                        vertical_sort=self.vertical_text,
+                        overwrite_ocr=self.overwrite_ocr,
                         progress_callback=lambda done, total, stored:
                             self.file_progress.emit(self.current_filename, done, total)
                     )
@@ -1709,12 +1875,14 @@ class MainWindow(QMainWindow):
         og = QGroupBox("OCR 选项")
         self._expert_groups.append(og)
         ol = QHBoxLayout(og)
-        self.vertical_check = QCheckBox("竖排文字")
-        self.vertical_check.setChecked(self.cfg.value("vertical", True, type=bool))
+        self.vertical_check = QCheckBox("竖排识别")
+        self.vertical_check.setChecked(self.cfg.value("vertical", False, type=bool))
         self.vertical_check.setToolTip(
-            "竖排文字检测 (小白推荐: 古籍开启，普通文档关闭):\n"
-            "  古籍/碑帖/对联等竖排文档 → 建议开启\n"
-            "  普通横排文档 → 关闭可提速"
+            "竖排阅读顺序优化 (古籍/碑帖/对联等竖排文档建议开启):\n"
+            "  开启后，OCR结果按竖排阅读顺序重新排列:\n"
+            "  先按文字列位置 从右→左，列内再按 从上→下\n"
+            "  普通横排文档 → 关闭保持原有顺序\n"
+            "  纯CPU后处理排序，几乎不增加耗时"
         )
         ol.addWidget(self.vertical_check)
         self.angle_cls_check = QCheckBox("方向纠正")
@@ -1766,6 +1934,16 @@ class MainWindow(QMainWindow):
             "  双实例会增加约1GB显存占用"
         )
         ol.addWidget(self.dual_check)
+        self.overwrite_ocr_check = QCheckBox("覆盖旧OCR")
+        self.overwrite_ocr_check.setChecked(self.cfg.value("overwrite_ocr", False, type=bool))
+        self.overwrite_ocr_check.setToolTip(
+            "覆盖旧OCR层 (导出双层PDF时生效):\n"
+            "  开启后，物理删除原PDF中的旧文字层，仅保留本次新识别文字\n"
+            "  扫描图像层与矢量图形 100% 无损保留\n"
+            "  适合对已有OCR层但效果差的PDF重新识别\n"
+            "  未开启时，新旧文字层合并保留（原有行为）"
+        )
+        ol.addWidget(self.overwrite_ocr_check)
         ol.addStretch()
         layout.addWidget(og)
 
@@ -2315,6 +2493,7 @@ class MainWindow(QMainWindow):
         self.cfg.setValue("shrink", self.shrink_check.isChecked())
         self.cfg.setValue("tensorrt", self.tensorrt_check.isChecked())
         self.cfg.setValue("dual", self.dual_check.isChecked())
+        self.cfg.setValue("overwrite_ocr", self.overwrite_ocr_check.isChecked())
         self.cfg.setValue("precision_idx", self.precision_combo.currentIndex())
         self.cfg.setValue("engine_id", self.engine_combo.currentData())
         self.cfg.setValue("model_val", self.model_combo.currentData() or "")
@@ -2353,6 +2532,7 @@ class MainWindow(QMainWindow):
         ocr_lang = lang_map.get(lang_display, "chinese")
         use_angle_cls = self.angle_cls_check.isChecked()
         scale = self.scale_combo.currentIndex() + 1
+        overwrite_ocr = self.overwrite_ocr_check.isChecked()
         extra_params = {}
         extra_params["enable_fp16"] = (self.precision_combo.currentData() == "fp16")
         extra_params["gpu_device"] = self.gpu_combo.currentData()
@@ -2376,6 +2556,7 @@ class MainWindow(QMainWindow):
             scale=scale,
             dual_instance=dual_instance,
             extra_params=extra_params,
+            overwrite_ocr=overwrite_ocr,
         )
         self.worker.file_progress.connect(self._on_progress)
         self.worker.file_finished.connect(self._on_finished)
@@ -2457,6 +2638,7 @@ class MainWindow(QMainWindow):
         self.scale_combo.setEnabled(False)
         self.vertical_check.setEnabled(False)
         self.angle_cls_check.setEnabled(False)
+        self.overwrite_ocr_check.setEnabled(False)
         self.precision_combo.setEnabled(False)
         self.dual_check.setEnabled(False)
         self.status_label.setText("处理中...")
@@ -2477,6 +2659,7 @@ class MainWindow(QMainWindow):
         self.scale_combo.setEnabled(True)
         self.vertical_check.setEnabled(True)
         self.angle_cls_check.setEnabled(True)
+        self.overwrite_ocr_check.setEnabled(True)
         self.precision_combo.setEnabled(True)
         self.dual_check.setEnabled(True)
         self.pause_label.setText("")
