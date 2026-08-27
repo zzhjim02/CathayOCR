@@ -345,7 +345,7 @@ graph TD
 | 下载方式 | 链接 |
 |:-------|:-----|
 | 📦 **中国移动云盘**（推荐） | [点击下载](<LITE_139_LINK_PLACEHOLDER>) |
-| 📦 **百度网盘**（备用，密码 2026） | [点击下载](<LITE_BAIDU_LINK_PLACEHOLDER>) |
+| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1gHGWonDz2RvQfsUGikYiYA?pwd=2026) |
 
 #### ② Pro 专业版（~5.8 GB）
 需要识别阿拉伯文、天城文等稀有语言，或需要多引擎对比时选这个。
