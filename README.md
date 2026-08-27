@@ -344,7 +344,7 @@ graph TD
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **中国移动云盘**（推荐） | [点击下载](https://yun.139.com/shareweb/#/w/i/2xop1s74Xpnvz) |
+| 📦 **中国移动云盘**（推荐） | [点击下载](https://yun.139.com/shareweb/#/w/i/2xop1H8ckR7b0) |
 | 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1gHGWonDz2RvQfsUGikYiYA?pwd=2026) |
 
 #### ② Pro 专业版（~5.8 GB）
@@ -353,14 +353,14 @@ graph TD
 | 下载方式 | 链接 |
 |:-------|:-----|
 | 📦 **中国移动云盘**（推荐） | [点击下载](<PRO_139_LINK_PLACEHOLDER>) |
-| 📦 **百度网盘**（备用，密码 2026） | [点击下载](<PRO_BAIDU_LINK_PLACEHOLDER>) |
+| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1tuSx3pgD9V-0XfJTDDbymg?pwd=2026) |
 
 #### ③ DEV 开发版（~10 GB）
 如果你想研究或修改代码，选这个（含全套源码和开发工具）。
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **百度网盘**（密码 2026） | [点击下载](<DEV_BAIDU_LINK_PLACEHOLDER>) |
+| 📦 **百度网盘**（密码 2026） | [点击下载](https://pan.baidu.com/s/18vdi-q3Uh_GfWzH3_YVYRw?pwd=2026) |
 
 ---
 
