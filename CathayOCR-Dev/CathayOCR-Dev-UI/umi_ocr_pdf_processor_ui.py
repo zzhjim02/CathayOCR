@@ -1,5 +1,5 @@
 """
-CathayOCR Dev v1.0 - 多引擎GPU加速PDF处理器
+CathayOCR Dev v1.2.3 - 多引擎GPU加速PDF处理器
 Architecture: 预渲染所有页面到RAM -> 单实例OCR流水线 -> 组装输出
 核心思想: GPU永不等待,CPU预渲染消除I/O瓶颈
 =======================================================
@@ -1408,7 +1408,7 @@ class PDFProcessor:
         return png_bytes
 
     def process_pdf(self, input_path, output_dir, total_pages, scale=2.0,
-                    progress_callback=None):
+                    progress_callback=None, vertical_sort=False, overwrite_ocr=False):
         """处理单个PDF文件。output_dir=None时输出到源文件所在目录"""
         if output_dir is None:
             output_dir = os.path.dirname(input_path)
@@ -1575,9 +1575,11 @@ class PDFProcessor:
         if self._need_restart:
             print("[Watchdog] ERROR: Full file restart also failed.")
             return None, None
-        return self.write_results(input_path, output_dir, total_pages, scale)
+        return self.write_results(input_path, output_dir, total_pages, scale,
+                                vertical_sort=vertical_sort, overwrite_ocr=overwrite_ocr)
 
-    def write_results(self, input_path, output_dir, total_pages, scale):
+    def write_results(self, input_path, output_dir, total_pages, scale,
+                     vertical_sort=False, overwrite_ocr=False):
         input_name = Path(input_path).stem
         txt_path = os.path.join(output_dir, f"{input_name}_result.txt")
         et = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1591,12 +1593,28 @@ class PDFProcessor:
             txt_file.write("=" * 60 + "\n\n")
             with _suppress_mupdf_warnings():
                 output_pdf = fitz.open(input_path)
+            # 覆盖旧OCR：物理删除旧文字层（修订Redaction），完整保留图像与矢量图形
+            if overwrite_ocr:
+                for _p in output_pdf:
+                    _p.add_redact_annot(_p.rect)   # 标记整页区域
+                    _p.apply_redactions(
+                        images=fitz.PDF_REDACT_IMAGE_NONE,      # 严禁删除图像
+                        graphics=fitz.PDF_REDACT_LINE_ART_NONE  # 保留矢量图形
+                    )
             output_page_count = 0
             for page_num in sorted(self.results.keys()):
                 result = self.results[page_num]
                 if result.get("code") != 100:
                     continue
                 text_blocks = result.get("data", [])
+                # 竖排排序：当勾选"竖排识别"时，按中心点X降序（右→左）再Y升序（上→下）
+                if vertical_sort and text_blocks:
+                    def _vertical_key(tb):
+                        box = tb.get("box", [[0,0],[0,0],[0,0],[0,0]])
+                        cx = (box[0][0] + box[2][0]) / 2
+                        cy = (box[0][1] + box[2][1]) / 2
+                        return (-cx, cy)  # X降序, Y升序
+                    text_blocks = sorted(text_blocks, key=_vertical_key)
                 page_text_lines = []
                 output_page = output_pdf[page_num]
                 output_page.clean_contents()
@@ -1610,16 +1628,32 @@ class PDFProcessor:
                     box = tb.get("box", [[0,0],[0,0],[0,0],[0,0]])
                     x0, y0 = box[0]
                     x2, y2 = box[2]
+                    # OCR引擎返回的是渲染图像像素坐标（图像=页面xscale），
+                    # 写入PDF前必须除以scale换算为PDF坐标，否则文字落在页面外无法提取/搜索
+                    x0 /= scale
+                    y0 /= scale
+                    x2 /= scale
+                    y2 /= scale
                     w = x2 - x0
                     h = y2 - y0
+                    # 竖排判定：勾选"竖排识别"且OCR框高>宽（竖条）时文字竖排写入，
+                    # 否则横排展开会超出页面（长句右侧文字落页外，查看器搜不到）。
+                    # 未勾选"竖排识别"时保持旧版横排行为。
+                    is_vertical_block = vertical_sort and h > w
                     fontsize = self.calculate_font_size(text, w, h)
-                    point = fitz.Point(x0, y2) * output_page.derotation_matrix
+                    if is_vertical_block:
+                        # 竖排：从框顶向下排（rotate=270），整句不溢出页面
+                        point = fitz.Point(x0, y0) * output_page.derotation_matrix
+                        rotate = 270
+                    else:
+                        point = fitz.Point(x0, y2) * output_page.derotation_matrix
+                        rotate = page_rotation
                     if not is_insert_font:
                         output_page.insert_font(fontname="cjk", fontbuffer=self.font.buffer)
                         is_insert_font = True
                     output_page.insert_text(
                         point, text, fontsize=fontsize, fontname="cjk",
-                        rotate=page_rotation, stroke_opacity=0, fill_opacity=0
+                        rotate=rotate, stroke_opacity=0, fill_opacity=0
                     )
                 if page_text_lines:
                     txt_file.write("\n" + "=" * 60 + "\n")
@@ -1666,7 +1700,8 @@ class BatchWorkerThread(QThread):
                  engine_id="umi_plugin_v6", use_gpu=True,
                  vertical_text=True, limit_side_len=2000,
                  model_size="medium", use_angle_cls=False,
-                 scale=2.0, dual_instance=True, extra_params=None):
+                 scale=2.0, dual_instance=True, extra_params=None,
+                 overwrite_ocr=False):
         super().__init__()
         self.file_list = file_list
         self.output_dir = output_dir
@@ -1679,6 +1714,7 @@ class BatchWorkerThread(QThread):
         self.scale = scale
         self.dual_instance = dual_instance
         self.extra_params = extra_params or {}
+        self.overwrite_ocr = overwrite_ocr
         self.is_cancelled = False
         self.is_paused = False
         self.processor = None
@@ -1717,6 +1753,8 @@ class BatchWorkerThread(QThread):
                     result = self.processor.process_pdf(
                         input_path, self.output_dir, total_pages,
                         scale=self.scale,
+                        vertical_sort=self.vertical_text,
+                        overwrite_ocr=self.overwrite_ocr,
                         progress_callback=lambda done, total, stored:
                             self.file_progress.emit(self.current_filename, done, total)
                     )
@@ -2106,14 +2144,25 @@ class MainWindow(QMainWindow):
         og = QGroupBox("OCR 选项")
         self._expert_groups.append(og)
         ol = QHBoxLayout(og)
-        self.vertical_check = QCheckBox("竖排文字")
-        self.vertical_check.setChecked(self.cfg.value("vertical", True, type=bool))
+        self.vertical_check = QCheckBox("竖排识别")
+        self.vertical_check.setChecked(self.cfg.value("vertical", False, type=bool))
         self.vertical_check.setToolTip(
-            "竖排文字检测 (小白推荐: 古籍开启，普通文档关闭):\n"
-            "  古籍/碑帖/对联等竖排文档 → 建议开启\n"
-            "  普通横排文档 → 关闭可提速"
+            "竖排识别 (v1.2.3 起真正生效):\n"
+            "  勾选后识别结果按竖排阅读顺序排列（右→左、列内上→下），\n"
+            "  且竖排文字以竖排方式写入PDF（可正常搜索）\n"
+            "  古籍/碑帖/对联等竖排文档 → 建议勾选\n"
+            "  普通横排文档 → 不勾选，保持横排行为"
         )
         ol.addWidget(self.vertical_check)
+        self.overwrite_ocr_check = QCheckBox("覆盖旧OCR")
+        self.overwrite_ocr_check.setChecked(self.cfg.value("overwrite_ocr", False, type=bool))
+        self.overwrite_ocr_check.setToolTip(
+            "覆盖旧OCR (替换双层文本):\n"
+            "  勾选后导出双层PDF时物理删除原PDF旧文字层，\n"
+            "  只保留本次新识别文字层（图像与矢量图形无损保留）\n"
+            "  适用于PDF自带效果差的旧OCR层，希望整体替换"
+        )
+        ol.addWidget(self.overwrite_ocr_check)
         self.angle_cls_check = QCheckBox("方向纠正")
         self.angle_cls_check.setChecked(self.cfg.value("angle_cls", False, type=bool))
         self.angle_cls_check.setToolTip(
@@ -2975,6 +3024,7 @@ class MainWindow(QMainWindow):
         self.cfg.setValue("side_len", self.side_len_spin.value())
         self.cfg.setValue("scale", self.scale_combo.currentIndex())
         self.cfg.setValue("vertical", self.vertical_check.isChecked())
+        self.cfg.setValue("overwrite_ocr", self.overwrite_ocr_check.isChecked())
         self.cfg.setValue("angle_cls", self.angle_cls_check.isChecked())
         self.cfg.setValue("rec_batch", self.rec_batch_spin.value())
         self.cfg.setValue("shrink", self.shrink_check.isChecked())
@@ -3015,6 +3065,7 @@ class MainWindow(QMainWindow):
         engine_id = self.get_selected_engine_id()
         use_gpu = self.get_use_gpu()
         vertical_text = self.vertical_check.isChecked()
+        overwrite_ocr = self.overwrite_ocr_check.isChecked()
         limit_side_len = self.side_len_spin.value()
         model_size = self.model_combo.currentData() or "medium"
         lang_map = dict(self._LANG_ITEMS)
@@ -3058,6 +3109,7 @@ class MainWindow(QMainWindow):
             scale=scale,
             dual_instance=dual_instance,
             extra_params=extra_params,
+            overwrite_ocr=overwrite_ocr,
         )
         self.worker.file_progress.connect(self._on_progress)
         self.worker.file_finished.connect(self._on_finished)
