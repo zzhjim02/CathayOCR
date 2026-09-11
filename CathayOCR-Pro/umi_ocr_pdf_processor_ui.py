@@ -545,6 +545,7 @@ class OCREngineAdapter(ABC):
         self.engine_id = engine_id
         self.plugin_dir = plugin_dir
         self.entry_path = entry_path
+        self._ocr_times = collections.deque(maxlen=20)  # 最近OCR耗时(秒)，用于自适应超时（所有引擎通用）
 
     @abstractmethod
     def start(self, params):
@@ -569,6 +570,49 @@ class OCREngineAdapter(ABC):
         """清理资源"""
         self.stop()
 
+    # ---------- 看门狗 / 自适应超时通用接口（所有引擎适配器均可用） ----------
+    def get_dynamic_timeout(self, floor=180, ceiling=300):
+        """根据所有活跃引擎实例的历史OCR耗时计算动态超时（通用实现）
+        - 默认 180s，慢设备自动升到 300s
+        - 样本不足 3 个时返回默认值（floor）
+        """
+        all_times = list(getattr(self, "_ocr_times", None) or [])
+        try:
+            client = globals().get("OCRClient")
+            insts = getattr(client, "_instances", None) if client is not None else None
+            for inst in (insts or []):
+                if inst is not self:
+                    all_times.extend(getattr(inst, "_ocr_times", None) or [])
+        except Exception:
+            pass
+        if len(all_times) < 3:
+            return floor
+        sorted_times = sorted(all_times)
+        p90_idx = int(len(sorted_times) * 0.9)
+        if p90_idx >= len(sorted_times):
+            p90_idx = len(sorted_times) - 1
+        p90 = sorted_times[p90_idx]
+        upgrade = p90 * 3
+        if upgrade <= floor:
+            return floor
+        return int(min(upgrade, ceiling))
+
+    def restart(self, params=None):
+        """强制重启引擎（通用实现：stop + start）"""
+        try:
+            self.stop()
+        except Exception:
+            pass
+        time.sleep(0.5)
+        if params is None:
+            params = getattr(self, "current_config", None)
+        if params is None:
+            return ""
+        try:
+            return self.start(params)
+        except Exception as e:
+            return f"[Error] restart failed: {e}"
+
 class PaddlePipeAdapter(OCREngineAdapter):
     """基于 PaddleOCR-json 管道通信的引擎适配器"""
 
@@ -587,6 +631,7 @@ class PaddlePipeAdapter(OCREngineAdapter):
 
     def start(self, params):
         self.stop()
+        self.current_config = params
         try:
             exe_path = self.entry_path
             cwd = os.path.dirname(exe_path)
@@ -637,6 +682,7 @@ class PaddlePipeAdapter(OCREngineAdapter):
             err_msg = "".join(self._stderr_lines).strip()
             return {"code": 902, "data": f"子进程已崩溃。stderr: {err_msg}"}
         write_str = json.dumps(write_dict, ensure_ascii=True, indent=None) + "\n"
+        t_ocr_start = time.time()
         try:
             self.pipe.stdin.write(write_str.encode("utf-8"))
             self.pipe.stdin.flush()
@@ -659,9 +705,12 @@ class PaddlePipeAdapter(OCREngineAdapter):
         if result["data"] is None:
             return {"code": 903, "data": "无返回数据"}
         try:
-            return json.loads(result["data"])
+            _ret = json.loads(result["data"])
         except Exception as e:
             return {"code": 904, "data": f"JSON解析失败: {e}"}
+        if isinstance(_ret, dict) and _ret.get("code") == 100:
+            self._ocr_times.append(time.time() - t_ocr_start)
+        return _ret
 
     def run_base64(self, image_base64, timeout=180):
         try:
@@ -783,12 +832,16 @@ class NcnnCPUAdapter(OCREngineAdapter):
             )
             request = {"img_path": img_path.replace("\\", "/")}
             json_str = json.dumps(request) + "\n"
+            t_ocr_start = time.time()
             stdout, stderr = proc.communicate(input=json_str.encode("utf-8"), timeout=timeout)
             if proc.returncode != 0:
                 err_msg = stderr.decode("utf-8", errors="ignore") if stderr else "Unknown"
                 return {"code": 102, "data": f"Process error (exit {proc.returncode}): {err_msg}"}
             stdout_str = stdout.decode("utf-8", errors="ignore")
-            return self._parse_json(stdout_str)
+            _ret = self._parse_json(stdout_str)
+            if isinstance(_ret, dict) and _ret.get("code") == 100:
+                self._ocr_times.append(time.time() - t_ocr_start)
+            return _ret
         except subprocess.TimeoutExpired:
             try:
                 proc.kill()
@@ -1470,7 +1523,9 @@ class PDFProcessor:
                 # 看门狗恢复循环：同一页最多重试到 T3（触发全文件重启）
                 while True:
                     # 动态超时：取实例0的 get_dynamic_timeout（已聚合所有活跃引擎的耗时）
-                    timeout_sec = self.ocr._instances[0].get_dynamic_timeout()
+                    _inst0 = self.ocr._instances[0]
+                    _gdt = getattr(_inst0, "get_dynamic_timeout", None)
+                    timeout_sec = _gdt() if callable(_gdt) else 180
                     t_page = time.time()
                     try:
                         result = self.ocr.ocr_image_base64(b64_data, timeout_seconds=timeout_sec)
