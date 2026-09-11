@@ -19,15 +19,12 @@
 
 </div>
 
-> ⚠️ **如果你使用的是 v1.1.3 及更早版本，请更新到 v1.2.3：**
+> ⚠️ **如果你使用的是 v1.2.3 及更早版本，请更新到 v1.2.4：**
 >
-> 🐛 **竖排识别无效** — 勾选「竖排文字」后顺序依然混乱？已修复 ✅（v1.2.3 起真正生效）
-> 🐛 **竖排 PDF 搜不到文字** — TXT 有字但双层 PDF 里搜不到？已修复 ✅（竖排文字横排写入超界）
-> 🐛 **导出 PDF 文字落页面外** — OCR 像素坐标未换算导致文字超界？已修复 ✅
-> 🆕 **覆盖旧OCR** — 物理删除旧文字层，只保留本次新识别层（图像/矢量无损）
-> 🆕 **TXT 文本层写回工具** — 批量修复"TXT 有字但 PDF 搜不到"的独立小工具
+> 🐛 **除 Vulkan 外其他引擎全部不可用** — 选 PP-OCRv6 / PP-OCRv5 / 经典版 / ncnn CPU / EasyOCR 处理，导出结果为空？已修复 ✅（Pro / Dev，v1.2.4 起）
+> 🐛 上述版本另含 v1.2.3 的全部修复：竖排识别无效 · 竖排 PDF 搜不到文字 · 导出文字落页面外 · 覆盖旧OCR · TXT 文本层写回工具
 >
-> ⬇️ [点击这里直接下载 v1.2.3](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.3)
+> ⬇️ [点击这里直接下载 v1.2.4](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.4)
 ---
 ## 🔗 Cathay 人文研究工具链
 
@@ -35,7 +32,7 @@
 
 | 步骤 | 工具 | 功能 | 状态 |
 |:----:|:----|:----|:----:|
-| ① | **⭐ CathayOCR (你在这里)** | 📄 多引擎 GPU 加速古籍 PDF 批处理 OCR | ✅ v1.2.3 |
+| ① | **⭐ CathayOCR (你在这里)** | 📄 多引擎 GPU 加速古籍 PDF 批处理 OCR | ✅ v1.2.4 |
 | ② | [**CathaySimplify** →](https://github.com/zzhjim02/CathaySimplify) | 🔄 TXT 繁简体批量双向转换 · 编码智能适配 | ✅ v1.0.0 |
 | ③ | [**CathayReader** →](https://github.com/zzhjim02/CathayReader) | 📖 PDF/TXT 双栏同步古籍校勘阅读器 | ✅ v1.0.0 |
 
@@ -335,9 +332,9 @@ graph TD
 
 ---
 
-### 🚀 推荐下载（最新版 v1.2.3）
+### 🚀 推荐下载（最新版 v1.2.4）
 
-> 📌 **v1.2.3 更新**：修复竖排识别无效 / 竖排文字搜不到 / 坐标超界三个 Bug，新增「覆盖旧OCR」功能与 TXT 文本层写回工具。详见下方 [v1.2.3 更新说明](#-v123-更新说明)。
+> 📌 **v1.2.4 更新**：修复除 ncnn Vulkan 外其他引擎全部不可用的问题（Pro / Dev）——此前选 PP-OCRv6 / PP-OCRv5 / 经典版 / ncnn CPU / EasyOCR 处理，导出结果没有文字。Lite 仅有 Vulkan 引擎，不受影响，安装包仍为 v1.2.3。详见下方 [v1.2.4 更新说明](#-v124-更新说明)。
 
 #### ① Lite 轻量版（~640 MB）← 大多数人选这个！
 适合识别中文、日文、韩文等常见语言，开箱即用。
@@ -352,16 +349,36 @@ graph TD
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **中国移动云盘**（推荐） | [点击下载](https://yun.139.com/shareweb/#/w/i/2xop1y7wqgHsb) |
-| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1tuSx3pgD9V-0XfJTDDbymg?pwd=2026) |
+| 📦 **中国移动云盘**（推荐） | [点击下载](<PRO_139_LINK_PLACEHOLDER>) |
+| 📦 **百度网盘**（备用，密码 2026） | [点击下载](<PRO_BAIDU_LINK_PLACEHOLDER>) |
 
 #### ③ DEV 开发版（~10 GB）
 如果你想研究或修改代码，选这个（含全套源码和开发工具）。
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **百度网盘**（密码 2026） | [点击下载](https://pan.baidu.com/s/18vdi-q3Uh_GfWzH3_YVYRw?pwd=2026) |
-| 📦 **中国移动云盘** | [点击下载](https://yun.139.com/shareweb/#/w/i/2xop1p6RxFSlt) |
+| 📦 **百度网盘**（密码 2026） | [点击下载](<DEV_BAIDU_LINK_PLACEHOLDER>) |
+| 📦 **中国移动云盘** | [点击下载](<DEV_139_LINK_PLACEHOLDER>) |
+
+---
+
+## 🆕 v1.2.4 更新说明
+
+> 发布日期：2026-09-11
+
+**一个严重 Bug 修复（仅影响 Pro / Dev）：**
+
+1. **修复「除 Vulkan 外其他引擎全部不可用」** — 选用 PP-OCRv6 (ONNX CUDA) / PP-OCRv5 / 经典版 / ncnn CPU / EasyOCR 时，引擎能启动、界面也不报错，但导出结果**没有任何文字**：`_result.txt` 只有文件头、`_layered.pdf` 里没有文字层。原因是 OCR 消费线程调用了**只存在于 Vulkan 适配器**上的 `get_dynamic_timeout()` → 非 Vulkan 引擎立刻抛 `AttributeError`，且该调用位于 `try` 之外，线程当场死亡、页面永远不会被识别。
+
+**修复内容：**
+
+- 把 `get_dynamic_timeout()` 与 `restart()` 提升到基类 `OCREngineAdapter` 提供通用实现（聚合耗时样本：不足 3 个返回 180s，否则按 p90×3 升档、上限 300s）；`NcnnVulkanAdapter` 保留自身实现，**Vulkan 行为零变化**
+- `PaddlePipeAdapter` / `NcnnCPUAdapter` 同样记录每页耗时 → 「慢设备自动升档超时」与看门狗自愈对**所有引擎**生效
+- `ocr_consumer` 调用处加 `getattr` 兜底，避免同类崩溃再次发生
+
+**验证**：6 引擎真机端到端回归全部通过 —— PP-OCRv6 42 字 / PP-OCRv5 42 字 / 经典版 41 字 / ncnn CPU 42 字 / EasyOCR 88 字 / ncnn Vulkan 正常。
+
+> 📌 **说明**：该缺陷源自 v1.1.3 的看门狗实现（v1.2.3 未触及），因此自 v1.1.3 起，除 Vulkan 外的引擎实际上一直不可用。**Lite 轻量版只有 ncnn Vulkan 引擎，不受影响。**
 
 ---
 
@@ -386,6 +403,14 @@ graph TD
 ---
 
 ### 📦 旧版本
+
+#### v1.2.3
+
+| 版本 | 百度网盘 | GitHub |
+|------|----------|--------|
+| **Lite 轻量版** | [下载](https://pan.baidu.com/s/1gHGWonDz2RvQfsUGikYiYA?pwd=2026) | [v1.2.3](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.3) |
+| **Pro 专业版** | [下载](https://pan.baidu.com/s/1tuSx3pgD9V-0XfJTDDbymg?pwd=2026) | [v1.2.3](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.3) |
+| **Dev 开发版** | [下载](https://pan.baidu.com/s/18vdi-q3Uh_GfWzH3_YVYRw?pwd=2026) | [v1.2.3](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.3) |
 
 #### v1.1.3
 
