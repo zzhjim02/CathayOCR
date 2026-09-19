@@ -33,7 +33,7 @@
 | 步骤 | 工具 | 功能 | 状态 |
 |:----:|:----|:----|:----:|
 | ① | **⭐ CathayOCR (你在这里)** | 📄 多引擎 GPU 加速古籍 PDF 批处理 OCR | ✅ v1.2.4 |
-| ② | [**CathayRestore** →](https://github.com/zzhjim02/CathayRestore) | 🔎 TXT 文本层写回 PDF（竖排/透明/可搜索） | ✅ v1.0 |
+| ② | [**CathayRestore** →](https://github.com/zzhjim02/CathayRestore) | 🔎 TXT 文本层写回 PDF（竖排/透明/可搜索） | ✅ v1.0.0 |
 | ③ | [**CathaySimplify** →](https://github.com/zzhjim02/CathaySimplify) | 🔄 TXT 繁简体批量双向转换 · 编码智能适配 | ✅ v1.0.0 |
 | ④ | [**CathayShelf** →](https://github.com/zzhjim02/CathayShelf) | 🗂️ 批量著录建夹 · 后缀替换 · 繁简转换+编码规范化 | ✅ v0.4.3 |
 | ⑤ | [**CathayReader** →](https://github.com/zzhjim02/CathayReader) | 📖 PDF/TXT 双栏同步古籍校勘阅读器 | ✅ v1.0.0 |
