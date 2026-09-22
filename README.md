@@ -31,6 +31,7 @@
 
 | 顺序 | 工具 | 干什么 | 状态 |
 |:---:|---|---|---|
+| ⓪ | [CathayPDG](https://github.com/zzhjim02/CathayPDG) | 读秀/超星 **PDG 批量转 PDF**：解压解密、横竖排分柜 | v0.1.5 |
 | ① | [**CathayIndex**](https://github.com/zzhjim02/CathayIndex) | 把本地文件夹（含子目录、孙目录）扫成「本地文件库」 | v1.0.0 |
 | ② | [**CathayFinder**](https://github.com/zzhjim02/CathayFinder) | 综合性图书检索引擎：11 个渠道，按书名 / 作者 / 出版者 / SSID 精准查 | v1.0.0 |
 | ③ | **CathayOCR（你在这里）** | 多引擎 GPU 加速古籍 PDF 批处理 OCR | v1.2.4 |
