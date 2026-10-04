@@ -1,6 +1,3 @@
-> 🏠 **本工具属于 [Cathay 系列软件](https://github.com/zzhjim02/Cathay)** —— 面向人文社会科学研究的电子书处理工具流，
-> 从找书、OCR、著录到索引、阅读、检索、摘录，覆盖文献处理全流程。**[→ 全部软件与下载入口](https://github.com/zzhjim02/Cathay)**
-
 <div align="center">
 
 # 🏛️ CathayOCR
@@ -37,7 +34,7 @@
 | 步骤 | 工具 | 一句话 | 版本 |
 |:---:|---|---|---|
 | ⓪ | [CathayRepair](https://github.com/zzhjim02/CathayRepair) | PDF 打不开、一翻就崩 → 先把它抢救回来 | v1.0.0 |
-| ① | [CathayPDG](https://github.com/zzhjim02/CathayPDG) | 读秀 / 超星的 PDG 压缩包 → PDF | v0.1.6 |
+| ① | [CathayPDG](https://github.com/zzhjim02/CathayPDG) | 读秀 / 超星的 PDG 压缩包 → PDF | v0.1.7 |
 | **②** | **CathayOCR（你在这里）** | 扫描件做 OCR → 能搜索、能复制的 PDF | **v1.2.4** |
 | ③ | [CathayRestore](https://github.com/zzhjim02/CathayRestore) | 把 OCR 出来的 TXT 写回 PDF，做成双层 | v1.0.0 |
 | ④ | [CathayExtract](https://github.com/zzhjim02/CathayExtract) | 已经是双层 PDF → 直接把文字抽成 TXT | v1.2.3 |
