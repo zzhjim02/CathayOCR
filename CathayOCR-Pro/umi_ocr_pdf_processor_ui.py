@@ -1,5 +1,5 @@
 """
-CathayOCR Pro (专业版) v1.2.3 - 多引擎GPU加速PDF处理器
+CathayOCR Pro (专业版) v1.3.0 - 多引擎GPU加速PDF处理器
 Architecture: 预渲染所有页面到RAM -> 单实例OCR流水线 -> 组装输出
 核心思想: GPU永不等待,CPU预渲染消除I/O瓶颈
 =======================================================
@@ -46,7 +46,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog,
     QProgressBar, QGroupBox, QMessageBox, QSpinBox, QComboBox, QCheckBox,
     QRadioButton, QButtonGroup, QListWidget, QListWidgetItem, QTreeView,
-    QTextBrowser, QFrame
+    QTextBrowser, QFrame, QGridLayout
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QSettings
 from PyQt5.QtGui import QFont
@@ -55,18 +55,23 @@ import fitz
 # 压制 MuPDF 的 PDF 结构语法警告（不影响识别结果）
 import os, sys
 import contextlib
+
+# 【修复】改用 PyMuPDF 官方开关一次性关闭 MuPDF 错误输出。
+# 旧实现用 os.dup2 重定向整个 stderr：渲染是多线程的，并发时各线程会互相
+# 覆盖/还原文件描述符，一旦交错，之后的错误输出就会被永久吞掉。
+# 官方开关是进程级、线程安全、不碰文件描述符，真正的 Python/引擎错误照常显示。
+try:
+    if hasattr(fitz, 'TOOLS') and hasattr(fitz.TOOLS, 'mupdf_display_errors'):
+        fitz.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
+
+
 @contextlib.contextmanager
 def _suppress_mupdf_warnings():
-    """临时压制MuPDF stderr输出"""
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    old_stderr = os.dup(2)
-    os.dup2(devnull, 2)
-    os.close(devnull)
-    try:
-        yield
-    finally:
-        os.dup2(old_stderr, 2)
-        os.close(old_stderr)
+    """保留接口（所有调用点不变）。实际静音已由上方官方开关完成。"""
+    yield
+
 # 全局抑制 fitz 日志级别
 if hasattr(fitz, 'TOOLS') and hasattr(fitz.TOOLS, 'set_log_level'):
     try:
@@ -164,8 +169,8 @@ register_engine(
 
 
 register_engine(
-    'win7_v5', 'PP-OCRv5 (Paddle CPU)',
-    '经典PaddleOCR引擎，v5版本\n纯CPU运行\n基于Paddle Inference\nMKL-DNN加速\n适合没有GPU的电脑使用\n旧版模型但精度不错',
+    'win7_v5', 'PP-OCRv5 (Paddle CPU) [备选]',
+    '备选引擎：其他引擎不可用时使用\n纯CPU运行（无GPU加速）\n基于Paddle Inference + MKL-DNN\n内置官方分语种识别模型\n覆盖全部支持语种\n（阿拉伯/天城文/泰/希腊/韩/俄/拉丁等）',
     'win7_x64_PaddleOCR-json_PP-OCRv5', 'PaddleOCR-json.exe', 'pipe',
     supports_gpu=False, supports_cpu=True,
     model_options=[],
@@ -781,9 +786,12 @@ class NcnnCPUAdapter(OCREngineAdapter):
         lang = params.get("lang", "chinese")
         if lang != "chinese":
             print(f"[ncnn] Language: {lang} (model already supports all characters)")
-        if "v3" in model_version:
+        # 【修复】字典必须跟随「实际选中的模型」selected，而不是传入的字符串。
+        # 传入名不在可用列表里时 selected 会回退为 available[0]；若仍按原字符串
+        # 选字典，就会出现「v5 字典 + v6 模型」→ 引擎 1~2 次请求后永久卡死。
+        if "v3" in selected:
             keys_file = "ppocr_keys_v1.txt"
-        elif "v6" in model_version:
+        elif "v6" in selected:
             keys_file = "ppocr_keys_v6.txt"
         else:
             keys_file = "ppocr_keys_v5.txt"
@@ -1013,9 +1021,12 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         lang = params.get("lang", "chinese")
         if lang != "chinese":
             print(f"[Vulkan] Language: {lang} (PP-OCRv6 dict covers Latin/CJK/Korean/Cyrillic)")
-        if "v3" in model_version:
+        # 【修复】字典必须跟随「实际选中的模型」selected，而不是传入的字符串。
+        # 传入名不在可用列表里时 selected 会回退为 available[0]；若仍按原字符串
+        # 选字典，就会出现「v5 字典 + v6 模型」→ 引擎 1~2 次请求后永久卡死。
+        if "v3" in selected:
             keys_file = "ppocr_keys_v1.txt"
-        elif "v6" in model_version:
+        elif "v6" in selected:
             keys_file = "ppocr_keys_v6.txt"
         else:
             keys_file = "ppocr_keys_v5.txt"
@@ -1248,7 +1259,40 @@ def build_engine_params(engine_id, use_gpu, vertical_text, limit_side_len,
         elif engine_id == "win7_v5":
             params["enable_mkldnn"] = True
             params["cpu_threads"] = extra_params.get("cpu_threads", 4)
-            params["config_path"] = "models/config_universal.txt"
+            # 按 lang 路由到对应文字系统的 config（各 config 指向官方分语种 rec 模型）
+            # 阿拉伯/天城文/泰/希腊/泰卢固/泰米尔 + 韩文 + 西里尔(eslav/cyrillic) + 拉丁(latin)
+            # 中/英/日及未列出语种回退 config_universal.txt（v5 server 模型）
+            lang_v5 = extra_params.get("lang", "") or ""
+            _v5_lang_config = {
+                # 阿拉伯字母系（含新补：普什图/信德/克什米尔/俾路支）
+                "ar": "arabic", "fa": "arabic", "ug": "arabic", "ur": "arabic",
+                "ps": "arabic", "sd": "arabic", "ks": "arabic", "bal": "arabic",
+                # 天城文系（含新补：博杰普尔/迈蒂利/孔卡尼）
+                "hi": "devanagari", "mr": "devanagari", "ne": "devanagari", "sa": "devanagari",
+                "bh": "devanagari", "mai": "devanagari", "kok": "devanagari",
+                # 单文字系
+                "th": "th", "el": "el", "te": "te", "ta": "ta",
+                # 韩文（官方 v5 专用模型，准确率 88%）
+                "korean": "korean",
+                # 东斯拉夫（俄/白俄/乌克兰）
+                "ru": "eslav", "uk": "eslav", "be": "eslav",
+                # 其余西里尔语种
+                "bg": "cyrillic", "mk": "cyrillic", "mn": "cyrillic", "kk": "cyrillic",
+                "ky": "cyrillic", "tg": "cyrillic", "tt": "cyrillic", "ba": "cyrillic",
+                "cv": "cyrillic", "rs_cyrillic": "cyrillic",
+            }
+            # 拉丁字母语种（40+ 种）统一走 latin 模型
+            _LATIN_CODES = {
+                "fr", "de", "es", "it", "pt", "nl", "ro", "ca", "gl", "da", "sv", "no",
+                "fi", "is", "pl", "cs", "sk", "hu", "hr", "sl", "bs", "rs_latin", "sq",
+                "ga", "cy", "et", "lt", "lv", "mt", "la", "pi", "af", "az", "uz", "ku",
+                "eu", "oc", "vi", "id", "ms", "tl", "sw", "mi", "tr",
+            }
+            if lang_v5 in _LATIN_CODES:
+                config_name = "latin"
+            else:
+                config_name = _v5_lang_config.get(lang_v5, "universal")
+            params["config_path"] = f"models/config_{config_name}.txt"
         elif engine_id == "win7_classic":
             params["enable_mkldnn"] = True
             params["cpu_threads"] = extra_params.get("cpu_threads", 4)
@@ -1936,12 +1980,19 @@ class MainWindow(QMainWindow):
         ("فارسی (波斯文／阿拉伯字母)", "fa"),
         ("ئۇيغۇرچە (维吾尔文／阿拉伯字母)", "ug"),
         ("اردو (乌尔都文／阿拉伯字母)", "ur"),
+        ("پښتو (普什图文／阿拉伯字母)", "ps"),
+        ("سنڌي (信德文／阿拉伯字母)", "sd"),
+        ("کٲشُر (克什米尔文／阿拉伯字母)", "ks"),
+        ("بلوچی (俾路支文／阿拉伯字母)", "bal"),
 
         # ── 天城文系 (V5 天城 ONNX 模型) ──
         ("हिन्दी (印地文)", "hi"),
         ("मराठी (马拉地文／天城文)", "mr"),
         ("नेपाली (尼泊尔文／天城文)", "ne"),
         ("संस्कृत (梵文／天城文)", "sa"),
+        ("भोजपुरी (博杰普尔文／天城文)", "bh"),
+        ("मैथिली (迈蒂利文／天城文)", "mai"),
+        ("कोंकणी (孔卡尼文／天城文)", "kok"),
 
         # ── 东南亚文字 (V5 ONNX 模型) ──
         ("ภาษาไทย (泰文)", "th"),
@@ -1949,9 +2000,117 @@ class MainWindow(QMainWindow):
         ("தமிழ் (泰米尔文)", "ta"),
 
         # ── 多语言 (混合) ──
-        ("多语言 (v6) — 中英法德日韩俄混合", "multilang_v6"),
-        ("多语言 (v5) — 46种拉丁语系", "multilang_v5"),
+        ("多语言混排 (中·英·日 + 拉丁语系)", "multilang_v6"),
+        ("多语言混排 (46 种拉丁语系)", "multilang_v5"),
     ]
+
+    # ── 简单模式合并语言表：(显示名[带说明], 代码, 专业模式对应显示名) ──
+    # 把 75 项按"引擎处理方式相同"的原则合并成 13 项：
+    #  - 主力引擎（v6/ncnn）内置通用字典直接支持的语种归并为 大类
+    #  - 需要 v5 分语种模型的单文字语种单列
+    _SIMPLE_LANG_ITEMS = [
+        # ⚠ 标记 = 勾选后切换到"专用分语种模型"（不在 v6/ncnn 通用字典里）：
+        #   - NVIDIA 显卡（不论显存大小）→ PP-OCRv6 引擎，服务端自动回退 PP-OCRv5 分语种模型
+        #   - 非 NVIDIA（AMD/Intel/纯CPU）→ win7_v5 (PP-OCRv5 Paddle CPU) 备选引擎
+        #   （希腊文实测 ncnn 字典可识 → 不切换）
+        ("中文", "ch", "中文 (Chinese)"),
+        ("英文", "en", "English (英文)"),
+        ("日文", "japan", "日本語 (日文)"),
+        ("韩文⚠", "korean", "한국어 (韩文)"),
+        ("西里尔文系⚠ (俄/乌/保等)", "ru", "Русский (俄文)"),
+        ("拉丁语系 (法德西意等)", "fr", "Français (法文)"),
+        ("阿拉伯文系⚠ (阿/波/维/乌等)", "ar", "العربية (阿拉伯文)"),
+        ("天城文系⚠ (印地/马拉地等)", "hi", "हिन्दी (印地文)"),
+        ("泰文⚠", "th", "ภาษาไทย (泰文)"),
+        ("希腊文", "el", "Ελληνικά (希腊文)"),
+        ("泰卢固文⚠", "te", "తెలుగు (泰卢固文)"),
+        ("泰米尔文⚠", "ta", "தமிழ் (泰米尔文)"),
+        ("多语言混排 (中·英·日 + 拉丁语系)", "multilang_v6", "多语言混排 (中·英·日 + 拉丁语系)"),
+    ]
+
+    # 需要"专用分语种模型"的语言组代码：这些文字不在 v6/ncnn 通用字典中
+    # （实测字典 0 字符覆盖）。NVIDIA 机 → PP-OCRv6 引擎（自动回退 PP-OCRv5 分语种模型）；
+    # 非 NVIDIA → win7_v5 (Paddle CPU) 备选。
+    # 注意：希腊文(el) 已实测 ncnn Vulkan 字典含希腊字符且识别正确 → 不切换；
+    #       多语言混排(multilang_v6) 以中英日为主不切换，混排韩俄请单独勾选对应组
+    _V5_FORCE_CODES = {"ar", "hi", "th", "te", "ta",
+                       "korean", "ru", "multilang_v5"}
+
+    # ncnn 引擎（v6 通用字典 18709 字符）不覆盖的语言代码 —— 用于专业模式开跑前守卫
+    # （韩文/西里尔/阿拉伯/天城文/泰/泰卢固/泰米尔实测均为乱码或空输出）
+    _NCNN_UNSUPPORTED = {
+        "korean",
+        # 西里尔
+        "ru", "uk", "be", "bg", "mk", "mn", "kk", "ky", "tg", "tt", "ba", "cv", "rs_cyrillic",
+        # 阿拉伯字母系
+        "ar", "fa", "ug", "ur", "ps", "sd", "ks", "bal",
+        # 天城文系
+        "hi", "mr", "ne", "sa", "bh", "mai", "kok",
+        # 单文字系
+        "th", "te", "ta",
+        # 多语言(v6) 含韩俄成分
+        "multilang_v6",
+    }
+
+    def _simple_langs_checked(self):
+        """返回勾选的语言代码列表（按合并表顺序）"""
+        if not hasattr(self, "simple_lang_checks"):
+            return ["ch"]
+        return [code for _disp, code, _full in self._SIMPLE_LANG_ITEMS
+                if code in self.simple_lang_checks and self.simple_lang_checks[code].isChecked()]
+
+    def _simple_primary_lang(self):
+        """返回 (主语言代码, 专业模式显示名)：优先取第一个触发降级的勾选项，否则第一个勾选项"""
+        checked = self._simple_langs_checked()
+        if not checked:
+            return "ch", "中文 (Chinese)"
+        pick = next((c for c in checked if c in self._V5_FORCE_CODES), checked[0])
+        for _disp, code, full in self._SIMPLE_LANG_ITEMS:
+            if code == pick:
+                return pick, full
+        return "ch", "中文 (Chinese)"
+
+    @classmethod
+    def _simple_pick_engine(cls, checked_codes, gpu_idx,
+                            available=("umi_plugin_v6", "ncnn_vulkan", "ncnn_cpu", "win7_v5")):
+        """简单模式引擎决策（纯逻辑，便于单测）。
+
+        gpu_idx 取值（与 simple_gpu 下拉一致）：
+          0 = NVIDIA独显(≥12GB)        1 = NVIDIA独显(≤8GB)
+          2 = AMD/Intel独显(≥12GB)     3 = AMD/Intel独显(≤8GB)
+          4 = 仅有核显/纯CPU           5 = 自动检测
+
+        规则：
+        1. 勾选了 ⚠ 语言（_V5_FORCE_CODES：阿拉伯字母/天城文/泰/泰卢固/泰米尔/韩文/西里尔）：
+           - **NVIDIA 显卡（≥12GB 或 ≤8GB 都算）** → umi_plugin_v6：
+             服务端自动回退官方 PP-OCRv5 分语种模型（实测韩/俄/阿/泰逐字正确，~3 秒/页）。
+             注：v5 分语种模型目前在该引擎内走 CPU 推理（ORT CUDA 内核在部分张量形状下
+             会崩，与显存大小无关），版本门槛只用于区分"选哪个引擎"，不代表独占 CUDA。
+           - 非 NVIDIA（AMD/Intel/核显/CPU）→ win7_v5 (PP-OCRv5 Paddle CPU) 备选（唯一实证可用）
+           这些文字不在 v6/ncnn 通用字典（实测 0 字符覆盖），ncnn 引擎必乱码。
+        2. 其余语言（普通路径）按显卡档位：
+           NVIDIA≥12GB(0)                          → umi_plugin_v6 (CUDA，精度最高)
+           NVIDIA≤8GB(1) / AMD/Intel(2,3)          → ncnn_vulkan (Vulkan+双实例，省显存、更快)
+           核显/纯CPU(4)                            → ncnn_cpu
+           希腊文实测 ncnn 字典可识，归入普通路径。
+           注：AMD/Intel 卡没有 CUDA，v6 引擎用不了 → 一律走 Vulkan。
+        返回 (engine_id, downgraded)。downgraded=True 表示语言触发了专用引擎/模型切换。
+        """
+        nvidia = gpu_idx in (0, 1)  # 任意 NVIDIA 卡都具备 CUDA 能力（含 ≤8GB）
+        if any(c in cls._V5_FORCE_CODES for c in checked_codes):
+            # 专用分语种模型路径：只要 N 卡就走 v6 引擎（不限显存），否则走 v5 CPU 备选
+            if nvidia and "umi_plugin_v6" in available:
+                return "umi_plugin_v6", True
+            for cand in ("win7_v5", "ncnn_vulkan", "ncnn_cpu"):
+                if cand in available:
+                    return cand, True
+            return "umi_plugin_v6", True
+        # 普通路径：仅大显存 N 卡走 CUDA；小显存 N 卡与 A/I 卡走 Vulkan（省显存、可双实例）
+        if gpu_idx == 0 and "umi_plugin_v6" in available:
+            return "umi_plugin_v6", False
+        if gpu_idx in (1, 2, 3) and "ncnn_vulkan" in available:
+            return "ncnn_vulkan", False
+        return "ncnn_cpu", False
 
     def __init__(self):
         super().__init__()
@@ -2027,18 +2186,25 @@ class MainWindow(QMainWindow):
         r3.addWidget(QLabel("💻 你的显卡"))
         self.simple_gpu = QComboBox()
         self.simple_gpu.addItems([
-            "NVIDIA独显 (显存≥12GB，推荐CUDA高精度)",
-            "NVIDIA独显 (显存≤8GB) 或 AMD/Intel独显",
+            "NVIDIA独显 (显存≥12GB)",
+            "NVIDIA独显 (显存≤8GB)",
+            "AMD / Intel 独显 (显存≥12GB)",
+            "AMD / Intel 独显 (显存≤8GB)",
             "仅有核显 / 纯CPU",
-            "🤖 我不知道选哪个 → 系统自动检测",
+            "🤖 不知道有没有独显 / 显存多大 → 自动检测",
         ])
         self.simple_gpu.setMinimumWidth(300)
         def set_gpu_tip(idx):
             tips = [
-                "显存充裕 → 用ONNX CUDA引擎，精度最高；适合16GB、12GB等大显存卡",
-                "显存较小或A/I卡 → 用ncnn Vulkan引擎+双实例，速度不输CUDA；8GB及以下首选",
-                "纯CPU运行，兼容性最好但速度最慢；仅适合简单文档",
-                "系统自动检测显卡型号和显存，选择最合适的引擎配置",
+                "NVIDIA 大显存 → ONNX CUDA 引擎，精度最高（也支持简单模式下的专用语种模型）；"
+                "精度优先时边长 2560",
+                "NVIDIA 小显存同样能用 CUDA（8GB 实测可用）；普通语言走 ncnn Vulkan+双实例更省显存，"
+                "勾选⚠语种时自动切到 CUDA 引擎；精度优先时边长 2240（防爆显存）",
+                "AMD / Intel 大显存独显 → ncnn Vulkan 引擎+双实例，速度不输 CUDA；精度优先时边长 2560",
+                "AMD / Intel 小显存独显 → ncnn Vulkan 引擎+双实例；精度优先时边长 2240（防爆显存）",
+                "纯CPU运行，兼容性最好但速度最慢；精度优先时边长 2560（无显存限制）",
+                "不知道有没有独立显卡，或者不知道显存多大？选这项，软件自动检测后帮你落到上面某一档\n"
+                "（检测顺序：nvidia-smi 读 NVIDIA 显存 → Vulkan 探测独显 → 都没有则按纯CPU）",
             ]
             self.simple_gpu.setToolTip(tips[idx] if idx < len(tips) else "")
         self.simple_gpu.currentIndexChanged.connect(set_gpu_tip)
@@ -2047,15 +2213,34 @@ class MainWindow(QMainWindow):
         r3.addStretch()
         sl.addLayout(r3)
 
-        # 问题4：语言
+        # 问题4：语言（多选勾选，勾选文档中可能出现的语言；仅用于帮助选择引擎，
+        #        不影响调用的识别字典/模型。⚠ 项会切到"专用分语种模型"）
         r4 = QHBoxLayout()
         r4.addWidget(QLabel("🌐 文档语言"))
-        self.simple_lang = QComboBox()
-        self.simple_lang.addItems([item[0] for item in self._LANG_ITEMS])
-        self.simple_lang.setMinimumWidth(300)
-        self.simple_lang.setMaxVisibleItems(20)
-        self.simple_lang.setToolTip("选择文档语言，部分引擎会自动切换对应OCR模型")
-        r4.addWidget(self.simple_lang)
+        lang_holder = QWidget()
+        lang_grid = QGridLayout(lang_holder)
+        lang_grid.setContentsMargins(0, 0, 0, 0)
+        lang_grid.setHorizontalSpacing(10)
+        lang_grid.setVerticalSpacing(2)
+        self.simple_lang_checks = {}
+        for _i, (disp, code, _full) in enumerate(self._SIMPLE_LANG_ITEMS):
+            cb = QCheckBox(disp)
+            if "⚠" in disp:
+                cb.setToolTip("该文字不在 v6/ncnn 通用字典中，勾选后系统自动切到专用分语种模型：\n"
+                              "  · NVIDIA 显卡（不论显存大小）→ PP-OCRv6 引擎，自动回退 PP-OCRv5 分语种模型\n"
+                              "  · AMD/Intel/纯CPU        → PP-OCRv5 (Paddle CPU) 备选引擎\n"
+                              "分语种模型目前为 CPU 推理，约 3 秒/页")
+            elif code == "multilang_v6":
+                cb.setToolTip("中·英·日 + 拉丁语系混排：主力引擎通用字典即可覆盖，不需要切换引擎。\n"
+                              "若混排中还含 韩文 / 俄文 等 ⚠ 文字，请另外把对应 ⚠ 组也勾上，\n"
+                              "否则这些文字会被输出成乱码。")
+            else:
+                cb.setToolTip("勾选文档中可能出现的语言；仅用于帮助系统选择引擎，\n"
+                              "不会切换识别字典/模型")
+            self.simple_lang_checks[code] = cb
+            lang_grid.addWidget(cb, _i // 4, _i % 4)
+        self.simple_lang_checks["ch"].setChecked(True)
+        r4.addWidget(lang_holder)
         r4.addStretch()
         sl.addLayout(r4)
 
@@ -2069,7 +2254,8 @@ class MainWindow(QMainWindow):
         self.simple_doc.currentIndexChanged.connect(self._apply_simple_settings)
         self.simple_speed.currentIndexChanged.connect(self._apply_simple_settings)
         self.simple_gpu.currentIndexChanged.connect(self._apply_simple_settings)
-        self.simple_lang.currentIndexChanged.connect(self._apply_simple_settings)
+        for _cb in self.simple_lang_checks.values():
+            _cb.stateChanged.connect(self._apply_simple_settings)
         sl.addStretch()
         layout.addWidget(self.simple_group)
         self.simple_group.setVisible(False)
@@ -2138,8 +2324,8 @@ class MainWindow(QMainWindow):
             "选择识别语言:\n"
             "  PP-OCRv6 引擎: 切换内置语言词典和字符集\n"
             "  EasyOCR 引擎: 切换识别模型\n"
-            "  多语言(v6) = 同时识别中/英/法/德/日/韩/俄\n"
-            "  ⚠ 多语言(v5)需要网络下载PP-OCRv5模型"
+            "  多语言混排 = 中/英/日 + 法/德/西/意等拉丁语系同时识别\n"
+            "  （若还需韩/俄等⚠文字，请直接在下方语言组里勾选对应项）"
         )
         self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
         el.addWidget(self.lang_combo)
@@ -2172,12 +2358,12 @@ class MainWindow(QMainWindow):
         cl.addWidget(self.side_len_spin)
         cl.addWidget(QLabel("渲染:"))
         self.scale_combo = QComboBox()
-        self.scale_combo.addItems(["1x(快速)", "2x(清晰)", "3x(超清)"])
+        self.scale_combo.addItems(["1x(快速)", "2x（高清）", "3x(超清)"])
         self.scale_combo.setCurrentIndex(self.cfg.value("scale", 1, type=int))
         self.scale_combo.setToolTip(
             "PDF页面渲染倍率 (小白推荐: 2x):\n"
             "  1x = 最快，但过小/过密文字可能识别不全\n"
-            "  2x (推荐) = 清晰与速度的平衡，适用大部分文档\n"
+            "  2x（高清）(推荐) = 高清与速度的平衡，适用大部分文档\n"
             "  3x = 超清，适合极小号字体PDF，速度最慢"
         )
         cl.addWidget(self.scale_combo)
@@ -2569,52 +2755,56 @@ class MainWindow(QMainWindow):
                 "  双实例会增加约1GB显存占用"
             )
 
-    def _auto_detect_gpu_idx(self):
-        """自动检测显卡，返回 simple_gpu 的最佳索引(0/1/2)"""
-        # 方式1：nvidia-smi 检测NVIDIA独显+显存
-        nvidia_vram = 0
-        nvidia_found = False
+    def _nvidia_tier(self):
+        """探测本机 NVIDIA 档位：返回 0(≥12GB) / 1(≤8GB) / None(无 NVIDIA 或探测失败)。
+
+        只发一次 nvidia-smi，比跑整套 _auto_detect_gpu_idx 便宜
+        （专业→简单同步时每次都要判一次）。"""
         try:
-            result = subprocess.run(
+            r = subprocess.run(
                 ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=8
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                for line in result.stdout.strip().splitlines():
-                    line = line.strip()
-                    if line.isdigit():
-                        vram = int(line)  # MiB
-                        nvidia_found = True
-                        if vram > nvidia_vram:
-                            nvidia_vram = vram
-        except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
-            pass
+                capture_output=True, text=True, timeout=8)
+            if r.returncode != 0 or not r.stdout.strip():
+                return None
+            vram = max(int(x) for x in r.stdout.split() if x.strip().isdigit())
+            return 0 if vram >= 11000 else 1  # ≈12GB 分界
+        except Exception:
+            return None
 
-        if nvidia_found:
-            # nvidia-smi 输出 MiB，12GB = 12288 MiB
-            if nvidia_vram >= 11000:  # ≈ 12GB
-                return 0  # NVIDIA≥12GB → CUDA
-            else:
-                return 1  # NVIDIA≤8GB → Vulkan
+    # ── 显卡档位常量（simple_gpu 下拉索引）──
+    #   0 NV≥12G | 1 NV≤8G | 2 A/I≥12G | 3 A/I≤8G | 4 核显·纯CPU | 5 自动检测
+    #   区别只在「精度优先」模式的边长：大显存(或CPU) 2560，小显存 2240（防爆显存）
+    _GPU_BIG = (0, 2, 4)
+    _GPU_SMALL = (1, 3)
+    # 简单模式统一使用的识别批处理数（不随精度档变化）
+    _SIMPLE_REC_BATCH = 16
 
-        # 方式2：检测任意 Vulkan 独显
+    def _auto_detect_gpu_idx(self):
+        """自动检测显卡，返回 simple_gpu 的最佳索引
+
+        索引含义：0=NVIDIA≥12GB  1=NVIDIA≤8GB  2=AMD/Intel≥12GB  3=AMD/Intel≤8GB  4=核显/纯CPU
+        """
+        # 方式1：nvidia-smi 检测 NVIDIA 独显 + 显存（返回值就是 0/1）
+        nv = self._nvidia_tier()
+        if nv is not None:
+            return nv
+
+        # 方式2：ncnn Vulkan 探测独显（nvidia-smi 不可用时）
+        #   注意：Vulkan 探测拿不到显存大小，AMD/Intel 一律保守按"小显存档"(3)；
+        #   用户若是 ≥12GB 的 A/I 卡，可在下拉里手动改选第 3 项。
         try:
-            devices = self._detect_vulkan_gpus()
-            for dev in devices:
+            for dev in self._detect_vulkan_gpus():
+                if not dev.get("dedicated"):
+                    continue
                 name = dev.get("name", "").lower()
-                typ = dev.get("type", "").lower()
-                is_integrated = (
-                    "integrated" in typ
-                    or any(kw in name for kw in ["uhd", "iris", "hd graphics"])
-                )
-                vram = dev.get("vram", 0)
-                if not is_integrated and (vram == 0 or vram > 512):
-                    return 1  # 有独显 → Vulkan
+                if any(k in name for k in ("nvidia", "geforce", "rtx", "gtx")):
+                    return 1  # NVIDIA（显存未知，按小显存档）
+                return 3      # AMD / Intel 独显
         except Exception:
             pass
 
-        # 方式3：默认 → 纯CPU
-        return 2
+        # 方式3：默认 → 核显 / 纯CPU
+        return 4
 
     def _on_ui_mode_changed(self, simple_mode):
         """切换简单模式/专业模式"""
@@ -2631,17 +2821,22 @@ class MainWindow(QMainWindow):
         self.simple_gpu.blockSignals(True)
         self.simple_speed.blockSignals(True)
         self.simple_doc.blockSignals(True)
-        self.simple_lang.blockSignals(True)
+        # 语言勾选框在下方设置时逐个 blockSignals
 
         eid = self.engine_combo.currentData()
         mode = self.mode_combo.currentData()
-        # 显卡：根据引擎推断
+        # 显卡：根据引擎推断（_nv: 0/1=NVIDIA 大小显存, None=非 NVIDIA）
+        _nv = self._nvidia_tier()
         if eid in ("ncnn_cpu", "win7_v5", "win7_classic"):
-            self.simple_gpu.setCurrentIndex(2)  # 纯CPU
+            self.simple_gpu.setCurrentIndex(4)  # 核显/纯CPU
         elif eid == "ncnn_vulkan":
-            self.simple_gpu.setCurrentIndex(1)  # 任意独显
+            # 任意独显：是 NVIDIA 就按 NVIDIA 档；否则按 AMD/Intel
+            # （Vulkan 探测读不到显存 → 保守落在小显存档 3）
+            self.simple_gpu.setCurrentIndex(_nv if _nv is not None else 3)
         else:
-            self.simple_gpu.setCurrentIndex(0)  # NVIDIA独显
+            # v6 (CUDA) 引擎：按实测显存落 NVIDIA 档（小显存在精度优先下套用 2240 防爆显存规则），
+            # 探测不到 NVIDIA 才回退到大显存档
+            self.simple_gpu.setCurrentIndex(_nv if _nv is not None else 0)
         # 精度：根据模型判断
         model = self.model_combo.currentText()
         shrink = self.shrink_check.isChecked()
@@ -2651,36 +2846,59 @@ class MainWindow(QMainWindow):
             self.simple_speed.setCurrentIndex(2)  # 精度优先
         else:
             self.simple_speed.setCurrentIndex(1)  # 标准平衡
-        # 文档：根据参数判断
-        side = self.side_len_spin.value()
-        scale = self.scale_combo.currentIndex()
+        # 文档：竖排是最可靠的标志（边长/渲染倍率已不再随文档类型变化）
         vertical = self.vertical_check.isChecked()
         angle = self.angle_cls_check.isChecked()
-        if vertical or (side >= 2800 and scale == 2):
+        if vertical:
             self.simple_doc.setCurrentIndex(1)  # 古籍竖排
         elif angle:
             self.simple_doc.setCurrentIndex(2)  # 扫描件
         else:
             self.simple_doc.setCurrentIndex(0)  # 普通文档
-        # 语言：直接同步（拉框内容一致）
-        lang_text = self.lang_combo.currentText()
-        lang_idx = self.simple_lang.findText(lang_text)
-        if lang_idx >= 0:
-            self.simple_lang.setCurrentIndex(lang_idx)
-        else:
-            self.simple_lang.setCurrentIndex(0)
+        # 语言：专业模式完整项 → 按代码归并到简单模式大类
+        _pro_code = dict(self._LANG_ITEMS).get(self.lang_combo.currentText(), "ch")
+        # 拉丁/西里尔其他语种归并到对应大类
+        _LATIN_SIMPLE = {"fr", "de", "es", "it", "pt", "nl", "ro", "ca", "gl", "da", "sv",
+                         "no", "fi", "is", "pl", "cs", "sk", "hu", "hr", "sl", "bs",
+                         "rs_latin", "sq", "ga", "cy", "et", "lt", "lv", "mt", "la", "pi",
+                         "af", "az", "uz", "ku", "eu", "oc", "vi", "id", "ms", "tl", "sw",
+                         "mi", "tr"}
+        _CYR_SIMPLE = {"bg", "mk", "mn", "kk", "ky", "tg", "tt", "ba", "cv", "rs_cyrillic"}
+        if _pro_code in _LATIN_SIMPLE:
+            _pro_code = "fr"
+        elif _pro_code in _CYR_SIMPLE:
+            _pro_code = "ru"
+        elif _pro_code in ("fa", "ug", "ur", "ps", "sd", "ks", "bal"):
+            _pro_code = "ar"
+        elif _pro_code in ("mr", "ne", "sa", "bh", "mai", "kok"):
+            _pro_code = "hi"
+        elif _pro_code == "multilang_v5":
+            _pro_code = "multilang_v6"
+        # 勾选对应语言组（仅勾该项，其余清空）
+        for _cb in self.simple_lang_checks.values():
+            _cb.blockSignals(True)
+            _cb.setChecked(False)
+            _cb.blockSignals(False)
+        _cb_target = self.simple_lang_checks.get(_pro_code)
+        if _cb_target is not None:
+            _cb_target.blockSignals(True)
+            _cb_target.setChecked(True)
+            _cb_target.blockSignals(False)
 
         self.simple_gpu.blockSignals(False)
         self.simple_speed.blockSignals(False)
         self.simple_doc.blockSignals(False)
-        self.simple_lang.blockSignals(False)
+        # 语言勾选框已逐个解除 blockSignals
 
         # 刷新 GPU 悬停提示（信号被阻断后需要手动调用）
         gpu_tips = [
-            "显存充裕 → 用ONNX CUDA引擎，精度最高；适合16GB、12GB等大显存卡",
-            "显存较小或A/I卡 → 用ncnn Vulkan引擎+双实例，速度不输CUDA；8GB及以下首选",
-            "纯CPU运行，兼容性最好但速度最慢；仅适合简单文档",
-            "系统自动检测显卡型号和显存，选择最合适的引擎配置",
+            "NVIDIA 大显存 → ONNX CUDA 引擎，精度最高；精度优先时边长 2560",
+            "NVIDIA 小显存同样能用 CUDA（8GB 实测可用）；普通语言走 ncnn Vulkan 更省显存、"
+            "可双实例加速，勾选⚠语种时自动切到 CUDA 引擎；精度优先时边长 2240",
+            "AMD / Intel 大显存独显 → ncnn Vulkan 引擎+双实例；精度优先时边长 2560",
+            "AMD / Intel 小显存独显 → ncnn Vulkan 引擎+双实例；精度优先时边长 2240",
+            "纯CPU运行，无显存限制；精度优先时边长 2560，但速度最慢",
+            "不知道有没有独立显卡，或不知道显存多大？选这项，自动检测后帮你落到上面某一档",
         ]
         self.simple_gpu.setToolTip(gpu_tips[self.simple_gpu.currentIndex()])
 
@@ -2693,17 +2911,17 @@ class MainWindow(QMainWindow):
         gpu_idx = self.simple_gpu.currentIndex()
 
         # ── 0. 自动检测（我不知道选哪个）──
-        if gpu_idx == 3:
+        if gpu_idx == 5:
             detected = getattr(self, "_auto_detecting", False)
             if detected:
-                # 防止递归，直接降级为纯CPU
+                # 防止递归，直接降级为 CPU
                 self._auto_detecting = True
                 self.simple_gpu.blockSignals(True)
-                self.simple_gpu.setCurrentIndex(2)
+                self.simple_gpu.setCurrentIndex(4)
                 self.simple_gpu.blockSignals(False)
                 self._auto_detecting = False
-                # 用CPU分支继续执行
-                gpu_idx = 2
+                # 用 CPU 分支继续执行
+                gpu_idx = 4
             else:
                 # 首次：运行自动检测
                 self._auto_detecting = True
@@ -2719,32 +2937,8 @@ class MainWindow(QMainWindow):
 
         # ── 1. 先设定引擎（开放信号，触发 _on_engine_changed 更新下拉选项） ──
         target_mode = None  # 稍后设置
-        if gpu_idx == 0:  # NVIDIA独显≥12GB
-            target_engine = "umi_plugin_v6"
-        elif gpu_idx == 1:  # NVIDIA≤8GB 或 AMD/Intel独显
-            target_engine = "ncnn_vulkan"
-        else:  # 纯CPU
-            target_engine = "ncnn_cpu"
-
-        # ── 语言兼容性检查：部分语系仅 PP-OCRv5 或 EasyOCR 支持 ──
-        lang_text = self.simple_lang.currentText()
-        # PP-OCRv6/ncnn V6 内嵌字典仅覆盖拉丁/CJK/韩/西里尔
-        # v5-only 语系：阿拉伯/天城文/泰文/希腊文/泰卢固/泰米尔 + 多语言(v5)
-        _V5_CODES = {"ar", "fa", "ug", "ur", "hi", "mr", "ne", "sa",
-                        "th", "el", "te", "ta", "multilang_v5"}
-        _V5_ONLY = {item[0] for item in self._LANG_ITEMS if item[1] in _V5_CODES}
-        if lang_text in _V5_ONLY:
-            # v5-only 语言需要 PP-OCRv5 ONNX 引擎
-            v5_idx = self.engine_combo.findData("win7_v5")
-            if v5_idx >= 0:
-                target_engine = "win7_v5"
-            else:
-                # win7_v5 不可用，降级为 ncnn
-                v5_fallback = self.engine_combo.findData("ncnn_vulkan")
-                if v5_fallback >= 0:
-                    target_engine = "ncnn_vulkan"
-                else:
-                    target_engine = "ncnn_cpu"
+        checked_langs = self._simple_langs_checked()
+        target_engine, downgraded = self._simple_pick_engine(checked_langs, gpu_idx)
 
         idx = self.engine_combo.findData(target_engine)
         if idx >= 0:
@@ -2754,39 +2948,42 @@ class MainWindow(QMainWindow):
         # ── 根据速度和文档类型计算参数 ──
         if speed_idx == 0:  # 速度优先
             target_model = "small"
-            target_rec_batch = 8
             target_precision = "fp16"
             target_shrink = False
         elif speed_idx == 1:  # 标准平衡
             target_model = "medium"
-            target_rec_batch = 12
             target_precision = "fp32"
             target_shrink = False
         else:  # 精度优先
             target_model = "medium"
-            target_rec_batch = 16
             target_precision = "fp32"
             target_shrink = True
 
+        # 识别批处理数：与精度档位无关，三档统一（固定 12）
+        target_rec_batch = self._SIMPLE_REC_BATCH
+
+        # 文档类型只决定「竖排 / 方向矫正」开关；边长与渲染倍率由「速度档 + 显存档」统一决定
         if doc_idx == 0:  # 普通文档
-            target_side = 2000
-            target_scale = 1  # 2x
             target_vertical = False
             target_angle = False
         elif doc_idx == 1:  # 古籍竖排
-            target_side = 2880
-            target_scale = 2  # 3x
             target_vertical = True
             target_angle = False
         else:  # 扫描件
-            target_side = 2400
-            target_scale = 1  # 2x
             target_vertical = False
             target_angle = True
 
-        # 8GB以内独显 + 精度优先 → 将边长限制为2240防爆显存
-        if speed_idx == 2 and gpu_idx == 1:
+        # ── 边长：速度优先/标准一律 2240；精度优先 大显存(或CPU) 2560 / 小显存 2240 ──
+        if speed_idx == 2:  # 精度优先
+            target_side = 2560 if gpu_idx in self._GPU_BIG else 2240
+        else:               # 速度优先(0) / 标准平衡(1)
             target_side = 2240
+
+        # ── 渲染倍率：只有「古籍 + 精度优先 + 大显存(或CPU)」用 3x，其余一律 2x ──
+        if doc_idx == 1 and speed_idx == 2 and gpu_idx in self._GPU_BIG:
+            target_scale = 2  # 3x
+        else:
+            target_scale = 1  # 2x
 
         target_dual = True  # 占位，稍后在设 mode 后重新计算
 
@@ -2804,11 +3001,9 @@ class MainWindow(QMainWindow):
         self.lang_combo.blockSignals(True)
 
         # ── 根据显卡选择引擎（已设置）和模式 ──
-        if gpu_idx == 0:  # NVIDIA≥12GB
+        if gpu_idx in (0, 1, 2, 3):  # 独显（任意品牌/显存）→ GPU 自动模式
             target_mode = "auto"
-        elif gpu_idx == 1:  # NVIDIA≤8GB或A/I
-            target_mode = "auto"
-        else:  # 纯CPU
+        else:  # 核显 / 纯CPU
             target_mode = "cpu"
         target_dual = (target_mode != "cpu")
         midx = self.mode_combo.findData(target_mode)
@@ -2828,9 +3023,9 @@ class MainWindow(QMainWindow):
         self.rec_batch_spin.setValue(target_rec_batch)
         self.shrink_check.setChecked(target_shrink)
         self.dual_check.setChecked(target_dual)
-        # 设置语言
-        lang_text = self.simple_lang.currentText()
-        lang_idx = self.lang_combo.findText(lang_text)
+        # 设置语言（勾选项主语言 → 专业模式完整项）
+        _simple_code, simple_full = self._simple_primary_lang()
+        lang_idx = self.lang_combo.findText(simple_full)
         if lang_idx >= 0:
             self.lang_combo.setCurrentIndex(lang_idx)
 
@@ -2859,14 +3054,14 @@ class MainWindow(QMainWindow):
         dual_label = "开" if target_dual else "关"
         precision_label = target_precision.upper()
 
-        # GPU 设备信息
+        # GPU 设备信息（注意：变量名不要用 gpu_idx —— 那是上面的"显卡档位"，别被覆盖）
         gpu_dev_text = ""
         try:
-            gpu_idx = self.gpu_combo.currentData()
+            dev_idx = self.gpu_combo.currentData()
             gpu_name = self.gpu_combo.currentText()
-            if gpu_idx is not None and gpu_idx >= 0:
+            if dev_idx is not None and dev_idx >= 0:
                 gpu_dev_text = gpu_name
-            elif gpu_idx is not None and gpu_idx == -1:
+            elif dev_idx is not None and dev_idx == -1:
                 gpu_dev_text = "自动 (优先独显)"
         except Exception:
             gpu_dev_text = "—"
@@ -2883,6 +3078,11 @@ class MainWindow(QMainWindow):
             preview_parts.append("竖排开")
         if target_angle:
             preview_parts.append("方向矫正")
+        if downgraded:
+            if gpu_idx in (0, 1):
+                preview_parts.append("⚠ 已切换：勾选⚠语言 → PP-OCRv6 引擎自动回退分语种模型")
+            else:
+                preview_parts.append("⚠ 已切换：勾选⚠语言 → PP-OCRv5 (Paddle CPU) 备选引擎")
         if gpu_dev_text and gpu_dev_text != "—":
             preview_parts.append(gpu_dev_text)
         preview_text = " · ".join(preview_parts)
@@ -2919,6 +3119,11 @@ class MainWindow(QMainWindow):
             self.lang_combo.setEnabled(True)
         elif eid == "easyocr_universal":
             self.lang_combo.addItems(["English (EasyOCR)", "Fran\u00e7ais (EasyOCR)", "Italiano (EasyOCR)", "Espa\u00f1ol (EasyOCR)"])
+            self.lang_combo.setEnabled(True)
+        elif eid == "win7_v5":
+            # win7_v5 (PP-OCRv5 Paddle CPU) [备选]: 全部语种
+            # 中/英/日→universal(server模型)；韩/西里尔/拉丁/阿拉伯/天城文等→官方分语种模型
+            self.lang_combo.addItems([item[0] for item in self._LANG_ITEMS])
             self.lang_combo.setEnabled(True)
         else:
             self.lang_combo.addItem("中文", "chinese")
@@ -3143,6 +3348,18 @@ class MainWindow(QMainWindow):
         extra_params["lang"] = ocr_lang
         if engine_id == "easyocr_universal":
             extra_params["easyocr_lang"] = lang_map.get(lang_display, "en")
+        # ── 引擎-语言兼容性守卫：ncnn 通用字典不含这些文字，识别必乱码 ──
+        if engine_id in ("ncnn_cpu", "ncnn_vulkan") and ocr_lang in self._NCNN_UNSUPPORTED:
+            _alt = "PP-OCRv6 (ONNX CUDA)" if use_gpu else "PP-OCRv5 (Paddle CPU)"
+            _resp = QMessageBox.question(
+                self, "引擎与语言不匹配",
+                f"「{lang_display}」的文字不在 ncnn 通用字典中（实测 0 字符覆盖），\n"
+                f"用当前引擎识别会输出乱码。\n\n"
+                f"建议改用：{_alt}（支持该语言），或 PP-OCRv5 (Paddle CPU)。\n\n"
+                f"仍要继续用当前引擎吗？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if _resp != QMessageBox.Yes:
+                return
         dual_instance = self.dual_check.isChecked()
         self.total_files = len(file_list)
         self.processed_files = 0
@@ -3304,35 +3521,135 @@ class MainWindow(QMainWindow):
         """窗口关闭时清理所有子进程"""
         print("[MainWindow] Cleaning up OCR instances...")
         try:
-            ocr = OCRClient()
-            ocr.close()
-            # 重置单例，确保下次启动全新
+            # 【修复】只在引擎实例确实存在时才关闭。
+            # 旧代码无条件 `OCRClient()`：实例不存在时会用默认参数真的启动
+            # 一次引擎（默认双实例）再关掉 —— 关窗白等数秒，还会抢显存。
+            if OCRClient._instance is not None:
+                OCRClient._instance.close()
             OCRClient._instance = None
         except Exception as e:
             print(f"[MainWindow] OCR cleanup: {e}")
-        # 强制杀死所有残余子进程
+        # 清理属于本软件目录的残余子进程
         self._kill_orphans()
         event.accept()
 
     def _kill_orphans(self):
-        """强制杀死所有相关子进程（os.system 在退出时更可靠）"""
-        for name in ["PaddleOCR-json.exe", "ppocr_ocr_vulkan.exe", "ppocr_ocr_cpu.exe"]:
-            os.system(f'taskkill /f /im {name} >nul 2>&1')
+        """只结束『属于本软件目录』的残余引擎进程。
+        【修复】旧实现是 os.system('taskkill /f /im ...') 按进程名全系统强杀，
+        会误伤其它位置的同名引擎（例如另一份正在运行的 CathayOCR）。"""
+        killed = _kill_engine_processes(CLEANUP_TARGETS)
+        if killed:
+            print(f"[MainWindow] Cleaned up local engine pids: {killed}")
 
 
 CLEANUP_TARGETS = ["PaddleOCR-json.exe", "ppocr_ocr_vulkan.exe", "ppocr_ocr_cpu.exe"]
 
 
+def _our_engine_dirs():
+    """本软件的『版本根目录』——要清理的引擎都在它下面：
+    ncnn/PPOCR-ncnn-Vulkan/、ncnn/PPOCR-ncnn-CPU/、ppocr_v3/、ppocr_v5/、ppocr_v6/。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [os.path.dirname(here)]
+
+
+def _kill_engine_processes(names, dirs=None):
+    """仅结束『exe 路径位于本软件目录内』且名字匹配的进程。
+    返回被结束的 pid 列表。非 Windows 平台直接返回空列表。
+
+    设计要点：绝不按进程名全局强杀 —— 只认完整路径，
+    因此不会影响其它目录（含 C 盘那份）正在运行的同类程序。"""
+    if platform.system() != "Windows":
+        return []
+    if dirs is None:
+        dirs = _our_engine_dirs()
+    names_l = {str(n).lower() for n in names}
+    dirs_l = {os.path.normcase(os.path.abspath(d)) for d in dirs if d}
+    if not dirs_l:
+        return []
+    killed = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:
+        return []
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_TERMINATE = 0x0001
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    my_pid = os.getpid()
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        return []
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            pid = int(pe.th32ProcessID)
+            exe_name = pe.szExeFile or ""
+            if pid != my_pid and exe_name.lower() in names_l:
+                h = kernel32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, False, pid)
+                if h:
+                    try:
+                        buf = ctypes.create_unicode_buffer(32768)
+                        size = wintypes.DWORD(len(buf))
+                        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                            full = os.path.normcase(os.path.abspath(buf.value))
+                            parent = os.path.dirname(full)
+                            in_our_dir = any(
+                                parent == d or parent.startswith(d + os.sep) for d in dirs_l)
+                            if in_our_dir:
+                                if kernel32.TerminateProcess(h, 1):
+                                    killed.append(pid)
+                    finally:
+                        kernel32.CloseHandle(h)
+            ok = kernel32.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        kernel32.CloseHandle(snap)
+    return killed
+
+
 def _force_cleanup():
-    """atexit 强制清理"""
-    for name in CLEANUP_TARGETS:
-        os.system(f'taskkill /f /im {name} >nul 2>&1')
+    """强制清理（只针对本软件目录内的引擎进程）"""
+    _kill_engine_processes(CLEANUP_TARGETS)
 
 
 if __name__ == '__main__':
-    # 启动前先杀死所有残余进程
-    for name in CLEANUP_TARGETS:
-        os.system(f'taskkill /f /im {name} >nul 2>&1')
+    # 启动前清理『本软件目录内』的残余引擎进程
+    # 【修复】不再按进程名全局强杀，避免误伤其它目录正在运行的同类程序
+    _kill_engine_processes(CLEANUP_TARGETS)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     window = MainWindow()

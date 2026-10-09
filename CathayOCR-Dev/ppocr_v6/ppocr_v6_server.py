@@ -49,7 +49,6 @@ def _setup_nvidia_dlls():
         # 2. onnxruntime capi 目录（已复制 CUDA DLL 到此处）
         ort_dir = os.path.join(site_dir, "onnxruntime", "capi")
         if os.path.isdir(ort_dir):
-            os.add_dll_directory(ort_dir)
             os.environ["PATH"] = ort_dir + os.pathsep + os.environ.get("PATH", "")
     except Exception:
         pass
@@ -91,6 +90,9 @@ def _get_gpu_total_memory_gb():
 # PP-OCRv6 内置字符集覆盖：中日韩 + Latin(46) + Cyrillic(33)
 # 这些语言可以用 PP-OCRv6 ONNX 模型
 _V6_LANGS = frozenset({
+    # PP-OCRv6 单模型官方仅支持 50 语种：ch/chinese_cht/en/japan + 46 拉丁语系
+    # （官方字典 ppocrv6_dict.txt 实测核对一致；韩文/西里尔/阿拉伯/天城文等不在 v6，
+    #   必须走下方 PP-OCRv5 分语种模型分支，官方模型已缓存于 models/official_models）
     # Latin
     "ch", "en", "french", "german", "es", "it", "pt", "nl", "pl", "ro", "sv",
     "cs", "da", "fi", "hu", "no", "sk", "sl", "hr", "lt", "lv", "et",
@@ -99,11 +101,6 @@ _V6_LANGS = frozenset({
     "fr", "de", "ca", "eu", "gl",
     # CJK
     "japan", "chinese_cht",
-    # Korean (PP-OCRv6 内嵌韩文字符)
-    "korean",
-    # Cyrillic (PP-OCRv6 内嵌)
-    "ru", "be", "uk", "bg", "mn", "kk", "ky", "tg", "mk", "tt", "cv",
-    "ba", "rs_cyrillic",
 })
 
 # PP-OCRv5 专用语言（PP-OCRv6 不支持，需走 v5 ONNX 模型）
@@ -255,16 +252,15 @@ def init_ocr(args):
         # 多语言 (v5)：PP-OCRv5 拉丁模型，覆盖 46 种拉丁语系语言
         lang = "latin"
     
-    # ═══════════════════════════════════════════════════════
-    # 模型初始化：所有语言统一使用 model_name 方式
-    # 绝不传 model_dir，避免 PaddleX 读取 inference.yml 中的 Hpi 配置
-    # 导致 use_hpip=True → 引擎自动检测为 HPI → 实际使用 CPU
-    # ═══════════════════════════════════════════════════════
-    gpu_info = "GPU" if use_gpu else "CPU"
-    
     if lang in _V6_LANGS or "&" in lang:
+        # PP-OCRv6 模型（从本地缓存加载）  
         det_model = f"PP-OCRv6_{model_size}_det"
         rec_model = f"PP-OCRv6_{model_size}_rec"
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        det_onnx_dir = os.path.join(script_dir, "models", f"PP-OCRv6_{model_size}_det_onnx")
+        rec_onnx_dir = os.path.join(script_dir, "models", f"PP-OCRv6_{model_size}_rec_onnx")
+        use_local = os.path.isdir(det_onnx_dir) and os.path.isdir(rec_onnx_dir)
+        
         ocr_args = {
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
@@ -272,32 +268,27 @@ def init_ocr(args):
             "lang": lang,
             "text_det_limit_side_len": limit_side_len,
             "text_recognition_batch_size": rec_batch_num,
-            "text_detection_model_name": det_model,
-            "text_recognition_model_name": rec_model,
         }
+        if use_local:
+            ocr_args["text_detection_model_name"] = det_model
+            ocr_args["text_detection_model_dir"] = det_onnx_dir
+            ocr_args["text_recognition_model_name"] = rec_model
+            ocr_args["text_recognition_model_dir"] = rec_onnx_dir
+        else:
+            ocr_args["text_detection_model_name"] = det_model
+            ocr_args["text_recognition_model_name"] = rec_model
         ocr_args.update(engine_kwargs)
-        print(f"[Init] PP-OCRv6 ({lang}, {model_size}, {gpu_info})", flush=True)
+        
+        print(f"[Init] PP-OCRv6 ({lang}, {model_size})", flush=True)
         _ocr = PaddleOCR(**ocr_args)
     else:
         # ─── PP-OCRv5 多语言 ──────────────────────────────
-        from paddleocr._utils.langs import DEVANAGARI_LANGS, ARABIC_LANGS, CYRILLIC_LANGS, ESLAV_LANGS
-        _REC_LANG_MAP = [
-            ("latin", lambda l: l == "latin"),
-            ("eslav", lambda l: l in ESLAV_LANGS),
-            ("arabic", lambda l: l in ARABIC_LANGS),
-            ("cyrillic", lambda l: l in CYRILLIC_LANGS),
-            ("devanagari", lambda l: l in DEVANAGARI_LANGS),
-            ("korean", lambda l: l == "korean"),
-            ("th", lambda l: l == "th"),
-            ("el", lambda l: l == "el"),
-            ("te", lambda l: l == "te"),
-            ("ta", lambda l: l == "ta"),
-        ]
-        v5_rec_name = None
-        for rec_lang, matcher in _REC_LANG_MAP:
-            if matcher(lang):
-                v5_rec_name = f"{rec_lang}_PP-OCRv5_mobile_rec"
-                break
+        # 不传模型名，让 PaddleOCR 根据 lang 自动选择 v5 模型
+        # ⚠ v5 分语种模型在 ORT CUDA EP 下存在运行期崩溃（RUNTIME_EXCEPTION），
+        #   实测 CPU EP 完全正常（韩/俄逐字正确）→ v5 分支强制 CPU 推理
+        if engine == "onnxruntime":
+            engine, engine_config = _select_engine(False, cpu_threads_val, model_size)
+            engine_kwargs = {"engine": engine, "engine_config": engine_config}
         ocr_args = {
             "use_doc_orientation_classify": False,
             "use_doc_unwarping": False,
@@ -306,15 +297,13 @@ def init_ocr(args):
             "ocr_version": "PP-OCRv5",
             "text_det_limit_side_len": limit_side_len,
             "text_recognition_batch_size": rec_batch_num,
-            "text_detection_model_name": "PP-OCRv5_server_det",
         }
-        if v5_rec_name:
-            ocr_args["text_recognition_model_name"] = v5_rec_name
         ocr_args.update(engine_kwargs)
-        print(f"[Init] PP-OCRv5 ({lang}, {gpu_info})", flush=True)
+        
+        print(f"[Init] PP-OCRv5 ({lang})", flush=True)
         _ocr = PaddleOCR(**ocr_args)
     
-    print(f"[Init] Ready (lang={lang}, det={det}, {gpu_info})", flush=True)
+    print(f"[Init] Ready (lang={lang}, det={det})", flush=True)
     print("OCR init completed.", flush=True)
 
 

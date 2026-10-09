@@ -1,5 +1,5 @@
 """
-CathayOCR Lite (CathayOCR极速版) v1.2.3 - 纯 Vulkan 引擎PDF处理器
+CathayOCR Lite (CathayOCR极速版) v1.3.0 - 纯 Vulkan 引擎PDF处理器
 Architecture: 预渲染所有页面到RAM -> 单实例OCR流水线 -> 组装输出
 核心思想: GPU永不等待,CPU预渲染消除I/O瓶颈
 =======================================================
@@ -51,18 +51,23 @@ import fitz
 # 压制 MuPDF 的 PDF 结构语法警告（不影响识别结果）
 import os, sys
 import contextlib
+
+# 【修复】改用 PyMuPDF 官方开关一次性关闭 MuPDF 错误输出。
+# 旧实现用 os.dup2 重定向整个 stderr：渲染是多线程的，并发时各线程会互相
+# 覆盖/还原文件描述符，一旦交错，之后的错误输出就会被永久吞掉。
+# 官方开关是进程级、线程安全、不碰文件描述符，真正的 Python/引擎错误照常显示。
+try:
+    if hasattr(fitz, 'TOOLS') and hasattr(fitz.TOOLS, 'mupdf_display_errors'):
+        fitz.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
+
+
 @contextlib.contextmanager
 def _suppress_mupdf_warnings():
-    """临时压制MuPDF stderr输出"""
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    old_stderr = os.dup(2)
-    os.dup2(devnull, 2)
-    os.close(devnull)
-    try:
-        yield
-    finally:
-        os.dup2(old_stderr, 2)
-        os.close(old_stderr)
+    """保留接口（所有调用点不变）。实际静音已由上方官方开关完成。"""
+    yield
+
 # 全局抑制 fitz 日志级别
 if hasattr(fitz, 'TOOLS') and hasattr(fitz.TOOLS, 'set_log_level'):
     try:
@@ -134,7 +139,7 @@ def register_engine(engine_id, display_name, description, plugin_rel_path,
 
 register_engine(
     'ncnn_vulkan', 'PP-OCR (ncnn Vulkan)',
-    '\u2b50 速度最快！\n支持NVIDIA/AMD/Intel任意显卡\nGPU模式+Vulkan加速\nCPU模式+ncnn原生\n支持多版本模型（v3~v6）\n支持中/英/法/德/日/意/西/葡/韩/俄/多语言',
+    '\u2b50 速度最快！\n支持NVIDIA/AMD/Intel任意显卡\nGPU模式+Vulkan加速\nCPU模式+ncnn原生\n支持多版本模型（v3~v6）\n支持中/英/法/德/日/意/西/葡/希腊/多语言\n（韩/俄/阿拉伯/天城文等请用专业版）',
     'paddle-ocr-ncnn-cpp_plugin-master/PPOCR-ncnn-Vulkan',
     'ppocr_ocr_vulkan.exe', 'ncnn_vulkan',
     supports_gpu=True, supports_cpu=True,
@@ -497,20 +502,26 @@ def _get_gpu_vram_mb():
     return None
 
 
-def _get_side_for_vram(doc_idx, gpu_idx):
+# ── 显卡档位（轻量版 simple_gpu 下拉索引）──
+#   0 大显存独显(≥12GB, 任意品牌) | 1 小显存独显(≤8GB) | 2 仅有核显 | 3 纯CPU
+#   轻量版只有 ncnn Vulkan / CPU，显卡品牌不改变引擎，只影响「精度优先」时的边长
+_GPU_BIG = (0, 3)    # 大显存独显 + 纯CPU（无显存限制）→ 精度优先边长 2560
+_GPU_SMALL = (1, 2)  # 小显存独显 / 核显 → 精度优先边长 2240（防爆显存）
+
+
+def _simple_side_scale(doc_idx, speed_idx, gpu_idx):
+    """简单模式「边长 / 渲染倍率」统一规则（与专业版一致）：
+      · 速度优先(0) / 标准平衡(1)：边长一律 2240，渲染一律 2x
+      · 精度优先(2)：大显存（或纯CPU）2560，小显存 2240
+      · 渲染 3x 仅限「古籍 + 精度优先 + 大显存（或纯CPU）」，其余一律 2x
+    返回 (target_side, target_scale_index)，scale index: 0=1x / 1=2x / 2=3x
     """
-    Return safe target_side based on GPU option. 信任用户选择，不做VRAM检测。
-    None = use default values (no adjustment needed).
-    gpu_idx: 0=大显存独显, 1=小显存独显, 2=核显, 3=纯CPU
-    """
-    if gpu_idx == 0 or gpu_idx == 3:  # 大显存独显 / 纯CPU → 用默认值
-        return None
-    # 小显存独显(1) / 核显(2) → 保守边长防爆
-    if doc_idx == 1:  # 古籍竖排, 原2880易爆显存
-        return 2240
-    if doc_idx == 2:  # 扫描件, 原2400保守到2000
-        return 2000
-    return None  # 普通文档2000不变
+    if speed_idx == 2:  # 精度优先
+        side = 2560 if gpu_idx in _GPU_BIG else 2240
+    else:               # 速度优先 / 标准平衡
+        side = 2240
+    scale = 2 if (doc_idx == 1 and speed_idx == 2 and gpu_idx in _GPU_BIG) else 1
+    return side, scale
 
 
 # 引擎适配器抽象基类
@@ -669,9 +680,12 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         lang = params.get("lang", "chinese")
         if lang != "chinese":
             print(f"[Vulkan] Language: {lang} (PP-OCRv6 dict covers Latin/CJK/Korean/Cyrillic)")
-        if "v3" in model_version:
+        # 字典必须按"实际选中的模型"(selected)选择，不能用传入的原始字符串：
+        # 若传入短名(如 "medium")，selected 会回退到 available[0]（真实模型），
+        # 此时仍按短名选字典会得到"v5字典 + v6模型"的不匹配 → 引擎 1~2 次请求后卡死。
+        if "v3" in selected:
             keys_file = "ppocr_keys_v1.txt"
-        elif "v6" in model_version:
+        elif "v6" in selected:
             keys_file = "ppocr_keys_v6.txt"
         else:
             keys_file = "ppocr_keys_v5.txt"
@@ -739,9 +753,10 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         lang = params.get("lang", "chinese")
         if lang != "chinese":
             print(f"[ncnn] Language: {lang} (model already supports all characters)")
-        if "v3" in model_version:
+        # 同 GPU 分支：字典必须跟随实际选中的模型(selected)，避免字典与模型不匹配
+        if "v3" in selected:
             keys_file = "ppocr_keys_v1.txt"
-        elif "v6" in model_version:
+        elif "v6" in selected:
             keys_file = "ppocr_keys_v6.txt"
         else:
             keys_file = "ppocr_keys_v5.txt"
@@ -870,44 +885,59 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         else:
             return {"code": 102, "data": result.get("data", result.get("error", "Unknown"))}
 
+    def _write_and_request(self, img_bytes, timeout=180):
+        """把 PNG 字节写入复用临时文件后请求引擎（GPU走TCP / CPU走管道）。
+        这是 run_base64 与 run_png_bytes 共用的核心路径 —— 引擎始终只收到文件路径，
+        两种入口写出的文件字节完全一致，因此识别结果不可能有差异。"""
+        # 复用固定临时文件：避免每页创建/删除临时文件（省磁盘I/O）
+        if not getattr(self, "_tmp_path", None):
+            try:
+                fd, self._tmp_path = tempfile.mkstemp(suffix=".png")
+                os.close(fd)
+            except Exception:
+                self._tmp_path = None
+        if self._tmp_path:
+            with open(self._tmp_path, "wb") as f:
+                f.write(img_bytes)
+            tmp_path = self._tmp_path
+        else:
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                tmp.write(img_bytes)
+                tmp_path = tmp.name
+        try:
+            t_ocr_start = time.time()
+            if self._use_gpu:
+                request = {"img_path": tmp_path.replace("\\", "/")}
+                result = self._tcp_request(request, timeout)
+            else:
+                result = self._run_exe(tmp_path, timeout)
+            elapsed = time.time() - t_ocr_start
+            if result.get("code") == 100:
+                self._ocr_times.append(elapsed)
+            return result
+        finally:
+            # 非复用回退路径仍需清理
+            if not self._tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
     def run_base64(self, image_base64, timeout=180):
         try:
             img_bytes = _b64.b64decode(image_base64)
-            # 复用固定临时文件：避免每页创建/删除临时文件（省磁盘I/O）
-            if not getattr(self, "_tmp_path", None):
-                try:
-                    fd, self._tmp_path = tempfile.mkstemp(suffix=".png")
-                    os.close(fd)
-                except Exception:
-                    self._tmp_path = None
-            if self._tmp_path:
-                with open(self._tmp_path, "wb") as f:
-                    f.write(img_bytes)
-                tmp_path = self._tmp_path
-            else:
-                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                    tmp.write(img_bytes)
-                    tmp_path = tmp.name
-            try:
-                t_ocr_start = time.time()
-                if self._use_gpu:
-                    request = {"img_path": tmp_path.replace("\\", "/")}
-                    result = self._tcp_request(request, timeout)
-                else:
-                    result = self._run_exe(tmp_path, timeout)
-                elapsed = time.time() - t_ocr_start
-                if result.get("code") == 100:
-                    self._ocr_times.append(elapsed)
-                return result
-            finally:
-                # 非复用回退路径仍需清理
-                if not self._tmp_path:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
+            return self._write_and_request(img_bytes, timeout)
         except Exception as e:
             return {"code": 900, "data": f"Base64 error: {str(e)}"}
+
+    def run_png_bytes(self, png_bytes, timeout=180):
+        """直接接收 PNG 字节（Lite 内部队列优化：省去每页一次 base64 编解码）。
+        写入临时文件后与 run_base64 走完全相同的请求路径，
+        引擎读到的文件字节一致 → 识别结果不变。"""
+        try:
+            return self._write_and_request(png_bytes, timeout)
+        except Exception as e:
+            return {"code": 900, "data": f"PNG bytes error: {str(e)}"}
 
     def run_path(self, img_path, timeout=180):
         if self._use_gpu:
@@ -1043,7 +1073,7 @@ class OCRClient:
 
     def __init__(self, engine_id="ncnn_vulkan", use_gpu=True,
                  vertical_text=True, limit_side_len=2000,
-                 model_size="medium", use_angle_cls=False,
+                 model_size="PP_OCRv6_medium", use_angle_cls=False,
                  dual_instance=True, extra_params=None):
         if extra_params is None:
             extra_params = {}
@@ -1088,6 +1118,14 @@ class OCRClient:
             self._adapter_index += 1
             return self._instances[idx].run_base64(image_base64, timeout_seconds)
         return self._instances[0].run_base64(image_base64, timeout_seconds)
+
+    def ocr_image_png(self, png_bytes, timeout_seconds=180):
+        """轮询调度多个实例（直接传 PNG 字节，与 ocr_image_base64 调度逻辑完全一致）"""
+        if self._dual_instance and len(self._instances) > 0:
+            idx = self._adapter_index % len(self._instances)
+            self._adapter_index += 1
+            return self._instances[idx].run_png_bytes(png_bytes, timeout_seconds)
+        return self._instances[0].run_png_bytes(png_bytes, timeout_seconds)
 
     def force_close(self):
         """强制关闭：直接 kill 子进程，立即中断阻塞的 OCR 调用"""
@@ -1239,10 +1277,11 @@ class PDFProcessor:
                         return
                     try:
                         png_bytes = self.render_page_from_doc(doc, pn, scale)
-                        b64_data = _b64.b64encode(png_bytes).decode("ascii")
+                        # 直接入队 PNG 字节（不再做 base64 编码：省一次编码 + 一次解码，
+                        # 队列内存降约 1/4；引擎读到的文件字节完全一致）
                         while not self._cancelled:
                             try:
-                                render_queue.put((pn, b64_data), timeout=1)
+                                render_queue.put((pn, png_bytes), timeout=1)
                                 break
                             except Full:
                                 continue
@@ -1267,7 +1306,7 @@ class PDFProcessor:
             _tier2_fired = False  # T2: 触发全文件重启（清空结果、重建引擎、从头跑）
             while my_done < total_pages and not self._cancelled:
                 try:
-                    pn, b64_data = render_queue.get(timeout=0.3)
+                    pn, png_bytes = render_queue.get(timeout=0.3)
                 except Empty:
                     if all_done.is_set():
                         break
@@ -1283,7 +1322,7 @@ class PDFProcessor:
                     timeout_sec = self.ocr._instances[0].get_dynamic_timeout()
                     t_page = time.time()
                     try:
-                        result = self.ocr.ocr_image_base64(b64_data, timeout_seconds=timeout_sec)
+                        result = self.ocr.ocr_image_png(png_bytes, timeout_seconds=timeout_sec)
                     except Exception as e:
                         result = {"code": 900, "data": f"OCR error: {str(e)}"}
                     # 检测超时（引擎假死：code=102 + "timeout"）
@@ -1528,7 +1567,7 @@ class BatchWorkerThread(QThread):
     def __init__(self, file_list, output_dir,
                  engine_id="ncnn_vulkan", use_gpu=True,
                  vertical_text=True, limit_side_len=2000,
-                 model_size="medium", use_angle_cls=False,
+                 model_size="PP_OCRv6_medium", use_angle_cls=False,
                  scale=2.0, dual_instance=True, extra_params=None,
                  overwrite_ocr=False):
         super().__init__()
@@ -1639,9 +1678,36 @@ class MainWindow(QMainWindow):
         ("Magyar (匈牙利文)", "hu"),
         ("Čeština (捷克文)", "cs"),
 
-        # ── 全字符集 ──
-        ("多语言 (全部)", "ch&en&fr&de&ja&ko&..."),
+        # ── 多语言混排 ──
+        ("多语言混排 (中·英·日 + 拉丁语系)", "ch&en&fr&de&ja&ko&..."),
     ]
+
+    # ── 简单模式语言列表 ──
+    #   ✅ 轻量版支持 = PP-OCRv6 通用字典覆盖：中文 / 英文 / 日文 / 拉丁语系 / 希腊文 / 中英日拉丁混排
+    #   ❌ 需专业版   = 字典 0 覆盖（实测逐字符核对）：韩文 / 西里尔 / 阿拉伯 / 天城文 / 泰 / 泰卢固 / 泰米尔
+    #   顺序上把"支持"的排前面，用一条分隔行隔开，灰显项 = 轻量版识别会乱码
+    _SIMPLE_LANG_SEP = "__NEED_PRO__"
+    _SIMPLE_LANG_ITEMS = [
+        ("中文", "ch", "中文 (Chinese)"),
+        ("英文", "en", "English (英文)"),
+        ("日文", "japan", "日本語 (日文)"),
+        ("拉丁语系 (法·德·西·意·葡等)", "fr", "Français (法文)"),
+        ("希腊文", "el", "Ελληνικά (希腊文)"),
+        ("多语言混排 (中·英·日 + 拉丁语系)", "multilang_v6", "多语言混排 (中·英·日 + 拉丁语系)"),
+        ("───── 以下文字需专业版 ─────", _SIMPLE_LANG_SEP, ""),
+        ("韩文", "korean", "한국어 (韩文)"),
+        ("西里尔文系 (俄/乌/保等)", "ru", "Pусский (俄文)"),
+        ("阿拉伯文系 (阿/波/维/乌等)", "ar", "العربية (阿拉伯文)"),
+        ("天城文系 (印地/马拉地等)", "hi", "हिन्दी (印地文)"),
+        ("泰文", "th", "ภาษาไทย (泰文)"),
+        ("泰卢固文", "te", "తెలుగు (泰卢固文)"),
+        ("泰米尔文", "ta", "தமிழ் (泰米尔文)"),
+    ]
+    _LITE_UNSUPPORTED_GROUPS = {"korean", "ru", "ar", "hi", "th", "te", "ta"}
+    # 专业模式语言代码级黑名单（ncnn v6 通用字典 0 覆盖）
+    _LITE_UNSUPPORTED_CODES = {
+        "korean", "ru",
+    }
 
     def __init__(self):
         super().__init__()
@@ -1717,18 +1783,21 @@ class MainWindow(QMainWindow):
         r3.addWidget(QLabel("💻 你的显卡"))
         self.simple_gpu = QComboBox()
         self.simple_gpu.addItems([
-            "NVIDIA/AMD/Intel 独显 (显存>=12GB, 高性能推荐)",
-            "NVIDIA 独显 (显存<=8GB) / AMD/Intel独显",
+            "独显 (显存≥12GB, NVIDIA/AMD/Intel)",
+            "独显 (显存≤8GB, NVIDIA/AMD/Intel)",
             "仅有核显",
             "纯CPU (兼容性最好, 速度最慢)",
+            "🤖 不知道有没有独显 / 显存多大 → 自动检测",
         ])
         self.simple_gpu.setMinimumWidth(300)
         def set_gpu_tip(idx):
             tips = [
-                "显存充裕，可处理高分辨率古籍/扫描件；古籍类默认2880边长",
-                "<=8GB显存，古籍竖排自动降为2240边长避免爆显存",
-                "集成显卡性能有限，推荐不高于2000边长",
-                "纯CPU运行，兼容性最好但速度最慢",
+                "大显存独显 → 可用较大边长；精度优先时边长 2560",
+                "≤8GB 显存独显 → 精度优先时边长 2240 避免爆显存",
+                "集成显卡显存/算力有限 → 精度优先时边长 2240",
+                "纯CPU运行，无显存限制；精度优先时边长 2560，但速度最慢",
+                "不知道有没有独立显卡，或者不知道显存多大？选这项，软件自动检测后帮你落到上面某一档\n"
+                "（检测顺序：nvidia-smi 读 NVIDIA 显存 → Vulkan 探测独显 → 都没有则按纯CPU）",
             ]
             self.simple_gpu.setToolTip(tips[idx] if idx < len(tips) else "")
         self.simple_gpu.currentIndexChanged.connect(set_gpu_tip)
@@ -1737,17 +1806,40 @@ class MainWindow(QMainWindow):
         r3.addStretch()
         sl.addLayout(r3)
 
-        # 问题4：语言
+        # 问题4：语言（先"轻量版支持"，分隔行之后是"需专业版" → 灰显不可选）
         r4 = QHBoxLayout()
         r4.addWidget(QLabel("🌐 文档语言"))
         self.simple_lang = QComboBox()
-        self.simple_lang.addItems([item[0] for item in self._LANG_ITEMS])
+        for _disp, _code, _full in self._SIMPLE_LANG_ITEMS:
+            self.simple_lang.addItem(_disp)
+        _lm = self.simple_lang.model()
+        for _i, (_disp, _code, _full) in enumerate(self._SIMPLE_LANG_ITEMS):
+            if _code == self._SIMPLE_LANG_SEP:
+                _lm.item(_i).setEnabled(False)  # 分隔行：只作分界提示，不可选
+                self.simple_lang.setItemData(_i, "分隔行：其下文字轻量版不支持", Qt.ToolTipRole)
+            elif _code in self._LITE_UNSUPPORTED_GROUPS:
+                _lm.item(_i).setEnabled(False)
+                self.simple_lang.setItemData(
+                    _i,
+                    "轻量版只有 ncnn 引擎，其 PP-OCRv6 通用字典不含该文字（识别会乱码）。\n"
+                    "请使用专业版：NVIDIA 显卡自动切换到专用分语种模型；\n"
+                    "AMD/Intel/纯CPU 则使用 PP-OCRv5 (Paddle CPU) 备选引擎。",
+                    Qt.ToolTipRole)
         self.simple_lang.setMinimumWidth(300)
         self.simple_lang.setMaxVisibleItems(20)
-        self.simple_lang.setToolTip("选择文档语言，部分引擎会自动切换对应OCR模型")
+        self.simple_lang.setToolTip("灰显项为轻量版不支持的文字（需专业版引擎）；选择语言只影响所用的模型/词典")
         r4.addWidget(self.simple_lang)
         r4.addStretch()
         sl.addLayout(r4)
+
+        # 支持范围说明（把"能识别哪些文字"写清楚）
+        self.simple_lang_hint = QLabel(
+            "✅ 轻量版支持：中文 · 英文 · 日文 · 拉丁语系（法/德/西/意/葡等）· 希腊文 · 中英日拉丁混排\n"
+            "❌ 需专业版：韩文 · 俄文等西里尔文 · 阿拉伯文 · 印地文等天城文 · 泰文 · 泰卢固文 · 泰米尔文"
+        )
+        self.simple_lang_hint.setStyleSheet("color: #777; font-size: 11px;")
+        self.simple_lang_hint.setWordWrap(True)
+        sl.addWidget(self.simple_lang_hint)
 
         # 配置摘要（一行灰色小字）
         self.simple_preview = QLabel()
@@ -1776,7 +1868,8 @@ class MainWindow(QMainWindow):
             "CathayOCR Lite (极速版)\n"
             "GPU模式+Vulkan加速 | CPU模式+ncnn原生\n"
             "支持NVIDIA/AMD/Intel任意显卡\n"
-            "支持中/英/法/德/日/意/西/葡/韩/俄/多语言\n"
+            "支持中/英/法/德/日/意/西/葡/希腊/多语言\n"
+            "（韩/俄/阿拉伯/天城文等请用专业版）\n"
             "支持多版本模型(v3~v6)"
         )
         self.engine_combo.currentData = lambda rid='ncnn_vulkan': rid
@@ -1812,9 +1905,10 @@ class MainWindow(QMainWindow):
         self.lang_combo.addItems(["中文", "English", "Français", "Deutsch", "日本語", "多语言"])
         self.lang_combo.setToolTip(
             "选择识别语言:\n"
-            "  ncnn PP-OCRv6 字典内置 CJK+拉丁+西里尔+韩文\n"
-            "  \"中文\" = 繁简体中文自动识别\n"
-            "  \"多语言 (全部)\" = 使用完整字典(18707字符)覆盖所有语种"
+            "  ncnn PP-OCRv6 通用字典：汉字 + 日文假名 + 拉丁 + 希腊字符\n"
+            "  （实测不含 韩文/西里尔/阿拉伯/天城文/泰系 → 需专业版）\n"
+            "  \"中文 (Chinese)\" = 繁简体中文自动识别\n"
+            "  \"多语言混排 (中·英·日 + 拉丁语系)\" = 用完整字典(18707字符)覆盖轻量版支持的全部文字"
         )
         self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
         el.addWidget(self.lang_combo)
@@ -1847,12 +1941,12 @@ class MainWindow(QMainWindow):
         cl.addWidget(self.side_len_spin)
         cl.addWidget(QLabel("渲染:"))
         self.scale_combo = QComboBox()
-        self.scale_combo.addItems(["1x(快速)", "2x(清晰)", "3x(超清)"])
+        self.scale_combo.addItems(["1x(快速)", "2x（高清）", "3x(超清)"])
         self.scale_combo.setCurrentIndex(self.cfg.value("scale", 1, type=int))
         self.scale_combo.setToolTip(
             "PDF页面渲染倍率 (小白推荐: 2x):\n"
             "  1x = 最快，但过小/过密文字可能识别不全\n"
-            "  2x (推荐) = 清晰与速度的平衡，适用大部分文档\n"
+            "  2x（高清）(推荐) = 高清与速度的平衡，适用大部分文档\n"
             "  3x = 超清，适合极小号字体PDF，速度最慢"
         )
         cl.addWidget(self.scale_combo)
@@ -2173,9 +2267,9 @@ class MainWindow(QMainWindow):
                 for dev in devices:
                     if dev.get("dedicated"):
                         vram = _get_gpu_vram_mb()
-                        if vram is not None and vram > 8000:
-                            return 0  # >=12GB
-                        return 1  # <=8GB
+                        if vram is not None and vram >= 11000:  # ≈12GB 分界（8GB=8192MB 属小显存）
+                            return 0  # 大显存独显
+                        return 1  # 小显存独显（显存读不到时同样保守按小显存档）
                 # 仅有核显
                 return 2
         except Exception:
@@ -2206,30 +2300,42 @@ class MainWindow(QMainWindow):
             self.simple_gpu.setCurrentIndex(3)  # 纯CPU
         else:
             self.simple_gpu.setCurrentIndex(0)  # 独显
-        # 精度：根据模型判断
+        # 精度：根据模型 + 精对齐判断（与专业版保持一致）
         model = self.model_combo.currentText()
+        shrink = self.shrink_check.isChecked()
         if "small" in model or "tiny" in model:
             self.simple_speed.setCurrentIndex(0)  # 速度优先
+        elif shrink:
+            self.simple_speed.setCurrentIndex(2)  # 精度优先
         else:
             self.simple_speed.setCurrentIndex(1)  # 标准平衡
-        # 文档：根据参数判断
-        side = self.side_len_spin.value()
-        scale = self.scale_combo.currentIndex()
+        # 文档：竖排是最可靠的标志（边长/渲染倍率已不再随文档类型变化）
         vertical = self.vertical_check.isChecked()
         angle = self.angle_cls_check.isChecked()
-        if vertical or (side >= 2800 and scale == 2):
+        if vertical:
             self.simple_doc.setCurrentIndex(1)  # 古籍竖排
         elif angle:
             self.simple_doc.setCurrentIndex(2)  # 扫描件
         else:
             self.simple_doc.setCurrentIndex(0)  # 普通文档
-        # 语言：直接同步（拉框内容一致）
+        # 语言：专业模式完整项 → 按代码归并到简单模式组；不支持的文字回落到"中文"
         lang_text = self.lang_combo.currentText()
-        lang_idx = self.simple_lang.findText(lang_text)
-        if lang_idx >= 0:
-            self.simple_lang.setCurrentIndex(lang_idx)
-        else:
-            self.simple_lang.setCurrentIndex(0)
+        _pro_code = dict(self._LANG_ITEMS).get(lang_text, "ch")
+        _LATIN_SIMPLE = {"fr", "de", "es", "it", "pt", "nl", "ro", "ca", "gl", "da", "sv",
+                         "no", "fi", "is", "pl", "cs", "sk", "hu", "hr", "sl", "bs",
+                         "rs_latin", "sq", "ga", "cy", "et", "lt", "lv", "mt", "la", "pi",
+                         "af", "az", "uz", "ku", "eu", "oc", "vi", "id", "ms", "tl", "sw",
+                         "mi", "tr"}
+        if _pro_code in _LATIN_SIMPLE:
+            _pro_code = "fr"
+        elif _pro_code == "ch&en&fr&de&ja&ko&...":
+            _pro_code = "multilang_v6"
+        _grp_disp = next((_d for _d, _c, _f in self._SIMPLE_LANG_ITEMS
+                          if _c == _pro_code and _c != self._SIMPLE_LANG_SEP), None)
+        if _grp_disp is None or _pro_code in self._LITE_UNSUPPORTED_GROUPS:
+            _grp_disp = "中文"  # 灰显项不可落在简单模式里，回落中文
+        lang_idx = self.simple_lang.findText(_grp_disp)
+        self.simple_lang.setCurrentIndex(lang_idx if lang_idx >= 0 else 0)
 
         self.simple_gpu.blockSignals(False)
         self.simple_speed.blockSignals(False)
@@ -2238,10 +2344,11 @@ class MainWindow(QMainWindow):
 
         # 刷新 GPU 悬停提示（信号被阻断后需要手动调用）
         gpu_tips = [
-            "显存充裕，可处理高分辨率古籍/扫描件；古籍类默认2880边长",
-            "<=8GB显存，古籍竖排自动降为2240边长避免爆显存",
-            "集成显卡性能有限，推荐不高于2000边长",
-            "纯CPU运行，兼容性最好但速度最慢",
+            "大显存独显 → 可用较大边长；精度优先时边长 2560",
+            "≤8GB 显存独显 → 精度优先时边长 2240 避免爆显存",
+            "集成显卡显存/算力有限 → 精度优先时边长 2240",
+            "纯CPU运行，无显存限制；精度优先时边长 2560，但速度最慢",
+            "不知道有没有独立显卡，或不知道显存多大？选这项，自动检测后帮你落到上面某一档",
         ]
         self.simple_gpu.setToolTip(gpu_tips[self.simple_gpu.currentIndex()])
 
@@ -2252,6 +2359,25 @@ class MainWindow(QMainWindow):
         doc_idx = self.simple_doc.currentIndex()
         speed_idx = self.simple_speed.currentIndex()
         gpu_idx = self.simple_gpu.currentIndex()
+
+        # ── 0. 「帮我选择」→ 自动检测显卡档位（0/1/2/3）──
+        if gpu_idx == 4:
+            if getattr(self, "_auto_detecting", False):
+                # 防递归：探测过程中直接按"纯CPU"继续
+                self._auto_detecting = True
+                self.simple_gpu.blockSignals(True)
+                self.simple_gpu.setCurrentIndex(3)
+                self.simple_gpu.blockSignals(False)
+                self._auto_detecting = False
+                gpu_idx = 3
+            else:
+                self._auto_detecting = True
+                best = self._auto_detect_gpu_idx()
+                self._auto_detecting = False
+                self.simple_gpu.blockSignals(True)
+                self.simple_gpu.setCurrentIndex(best)
+                self.simple_gpu.blockSignals(False)
+                gpu_idx = best
 
         # ── 文档类型→参数映射 ──
         if speed_idx == 0:  # 速度优先
@@ -2264,23 +2390,17 @@ class MainWindow(QMainWindow):
             target_model = "medium"
             target_precision = "fp32"
 
+        # 文档类型只决定「竖排 / 方向矫正」开关；边长与渲染倍率由统一规则决定
         if doc_idx == 0:  # 普通文档
-            target_side = 2000
-            target_scale = 1  # 2x
             target_vertical = False
             target_angle = False
         elif doc_idx == 1:  # 古籍竖排
-            adjusted = _get_side_for_vram(doc_idx, gpu_idx)
-            target_side = adjusted if adjusted is not None else 2880
-            target_scale = 2  # 3x
             target_vertical = True
             target_angle = False
         else:  # 扫描件
-            adjusted = _get_side_for_vram(doc_idx, gpu_idx)
-            target_side = adjusted if adjusted is not None else 2400
-            target_scale = 1  # 2x
             target_vertical = False
             target_angle = True
+        target_side, target_scale = _simple_side_scale(doc_idx, speed_idx, gpu_idx)
 
         # ── GPU→mode映射 ──
         if gpu_idx == 3:  # 纯CPU
@@ -2310,9 +2430,18 @@ class MainWindow(QMainWindow):
         self.vertical_check.setChecked(target_vertical)
         self.angle_cls_check.setChecked(target_angle)
         self.dual_check.setChecked(target_dual)
-        # 语言同步
-        lang_text = self.simple_lang.currentText()
-        lang_idx = self.lang_combo.findText(lang_text)
+        # 语言同步（分隔行 / 灰显的"需专业版"项 → 回落中文）
+        _li = self.simple_lang.currentIndex()
+        _entry = self._SIMPLE_LANG_ITEMS[_li] if 0 <= _li < len(self._SIMPLE_LANG_ITEMS) else None
+        if (_entry is None or _entry[1] == self._SIMPLE_LANG_SEP
+                or _entry[1] in self._LITE_UNSUPPORTED_GROUPS):
+            _full = "中文 (Chinese)"
+            self.simple_lang.blockSignals(True)
+            self.simple_lang.setCurrentIndex(0)
+            self.simple_lang.blockSignals(False)
+        else:
+            _full = _entry[2] or "中文 (Chinese)"
+        lang_idx = self.lang_combo.findText(_full)
         if lang_idx >= 0:
             self.lang_combo.setCurrentIndex(lang_idx)
 
@@ -2351,13 +2480,20 @@ class MainWindow(QMainWindow):
     def _update_lang_combo(self):
         self.lang_combo.blockSignals(True)
         self.lang_combo.clear()
-        # 直接从 _LANG_ITEMS 填充（ncnn PP-OCRv6 通用字典覆盖所有语种）
+        # 直接从 _LANG_ITEMS 填充；ncnn v6 通用字典不覆盖的文字灰显（需专业版）
         for label, code in self._LANG_ITEMS:
             self.lang_combo.addItem(label, code)
+        _m = self.lang_combo.model()
+        for _i, (_label, _code) in enumerate(self._LANG_ITEMS):
+            if _code in self._LITE_UNSUPPORTED_CODES:
+                _m.item(_i).setEnabled(False)
+                self.lang_combo.setItemData(_i, "轻量版引擎不支持该文字（识别会乱码），请使用专业版", Qt.ToolTipRole)
         last_lang = self.cfg.value("lang_val", "中文 (Chinese)")
         idx = self.lang_combo.findText(last_lang)
-        if idx >= 0:
+        if idx >= 0 and self.lang_combo.model().item(idx).isEnabled():
             self.lang_combo.setCurrentIndex(idx)
+        else:
+            self.lang_combo.setCurrentIndex(0)
         self.lang_combo.blockSignals(False)
 
     def _populate_gpu_combo(self):
@@ -2526,7 +2662,7 @@ class MainWindow(QMainWindow):
         use_gpu = self.get_use_gpu()
         vertical_text = self.vertical_check.isChecked()
         limit_side_len = self.side_len_spin.value()
-        model_size = self.model_combo.currentData() or "medium"
+        model_size = self.model_combo.currentData() or _get_first_valid_ncnn_model(engine_id) or "PP_OCRv6_medium"
         lang_map = dict(self._LANG_ITEMS)
         lang_display = self.lang_combo.currentText() or "中文 (Chinese)"
         ocr_lang = lang_map.get(lang_display, "chinese")
@@ -2700,35 +2836,141 @@ class MainWindow(QMainWindow):
         """窗口关闭时清理所有子进程"""
         print("[MainWindow] Cleaning up OCR instances...")
         try:
-            ocr = OCRClient()
-            ocr.close()
-            # 重置单例，确保下次启动全新
+            # 【修复】只在引擎实例确实存在时才关闭。
+            # 旧代码无条件 `OCRClient()`：实例不存在时会用默认参数真的启动
+            # 一次引擎（默认双实例）再关掉 —— 关窗白等数秒，还会抢显存。
+            if OCRClient._instance is not None:
+                OCRClient._instance.close()
             OCRClient._instance = None
         except Exception as e:
             print(f"[MainWindow] OCR cleanup: {e}")
-        # 强制杀死所有残余子进程
+        # 清理属于本目录的残余子进程
         self._kill_orphans()
         event.accept()
 
     def _kill_orphans(self):
-        """强制杀死所有相关子进程（os.system 在退出时更可靠）"""
-        for name in ["ppocr_ocr_vulkan.exe"]:
-            os.system(f'taskkill /f /im {name} >nul 2>&1')
+        """只结束『属于本程序目录』的残余引擎进程。
+        【修复】旧实现 taskkill /f /im 是按进程名全系统强杀，
+        会误伤其它位置的同名引擎（例如另一份正在运行的 CathayOCR）。"""
+        killed = _kill_engine_processes(CLEANUP_TARGETS)
+        if killed:
+            print(f"[MainWindow] Cleaned up local engine pids: {killed}")
 
 
 CLEANUP_TARGETS = ["ppocr_ocr_vulkan.exe"]
 
 
+def _kill_engine_processes(names, dirs=None):
+    """仅结束『exe 路径位于本程序引擎目录内』且名字匹配的进程。
+    返回被结束的 pid 列表。非 Windows 平台直接返回空列表。
+
+    设计要点：绝不按进程名全局强杀 —— 只认完整路径，
+    因此不会影响其它目录（含 C 盘那份）正在运行的同类程序。"""
+    if platform.system() != "Windows":
+        return []
+    if dirs is None:
+        dirs = _our_engine_dirs()
+    names_l = {str(n).lower() for n in names}
+    dirs_l = {os.path.normcase(os.path.abspath(d)) for d in dirs if d}
+    if not dirs_l:
+        return []
+    killed = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:
+        return []
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_TERMINATE = 0x0001
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    my_pid = os.getpid()
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        return []
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            pid = int(pe.th32ProcessID)
+            exe_name = pe.szExeFile or ""
+            if pid != my_pid and exe_name.lower() in names_l:
+                h = kernel32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, False, pid)
+                if h:
+                    try:
+                        buf = ctypes.create_unicode_buffer(32768)
+                        size = wintypes.DWORD(len(buf))
+                        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                            full = os.path.normcase(os.path.abspath(buf.value))
+                            parent = os.path.dirname(full)
+                            in_our_dir = any(
+                                parent == d or parent.startswith(d + os.sep) for d in dirs_l)
+                            if in_our_dir:
+                                if kernel32.TerminateProcess(h, 1):
+                                    killed.append(pid)
+                    finally:
+                        kernel32.CloseHandle(h)
+            ok = kernel32.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        kernel32.CloseHandle(snap)
+    return killed
+
+
+def _our_engine_dirs():
+    """本程序所有引擎可执行文件所在目录（绝对路径）。"""
+    dirs = []
+    try:
+        for info in _PLUGIN_DIRS.values():
+            entry = info.get("entry_path")
+            if entry:
+                dirs.append(os.path.dirname(os.path.abspath(entry)))
+    except Exception:
+        pass
+    return dirs
+
+
 def _force_cleanup():
-    """atexit 强制清理"""
-    for name in CLEANUP_TARGETS:
-        os.system(f'taskkill /f /im {name} >nul 2>&1')
+    """强制清理（只针对本目录内的引擎进程）"""
+    _kill_engine_processes(CLEANUP_TARGETS)
 
 
 if __name__ == '__main__':
-    # 启动前先杀死所有残余进程
-    for name in CLEANUP_TARGETS:
-        os.system(f'taskkill /f /im {name} >nul 2>&1')
+    # 启动前清理『本程序目录内』的残余引擎进程
+    # 【修复】不再全局按名强杀，避免误伤其它目录正在运行的同类程序
+    _kill_engine_processes(CLEANUP_TARGETS)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     window = MainWindow()
