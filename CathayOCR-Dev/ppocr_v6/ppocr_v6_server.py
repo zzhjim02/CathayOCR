@@ -115,7 +115,7 @@ _V5_LANGS = frozenset({
 })
 
 
-def _select_engine(use_gpu, cpu_threads=None, model_size="medium"):
+def _select_engine(use_gpu, cpu_threads=None, model_size="medium", gpu_device=0):
     """自动选择推理引擎。优先 onnxruntime（轻量），未安装则回退 paddle。"""
     _setup_nvidia_dlls()
     try:
@@ -132,7 +132,7 @@ def _select_engine(use_gpu, cpu_threads=None, model_size="medium"):
             "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
             "provider_options": [
                 {
-                    "device_id": 0,
+                    "device_id": int(gpu_device),
                     "gpu_mem_limit": gpu_mem_limit,
                     "arena_extend_strategy": "kSameAsRequested",
                     "cudnn_conv_algo_search": "HEURISTIC",
@@ -238,7 +238,15 @@ def init_ocr(args):
             cpu_threads_val = int(args.cpu_threads)
         except ValueError:
             pass
-    engine, engine_config = _select_engine(use_gpu, cpu_threads_val, model_size)
+    # CUDA 设备号（UI 的「GPU:」下拉；缺省 0 = 第一块 NVIDIA 卡）
+    gpu_device_val = 0
+    _gd_raw = str(getattr(args, "gpu_device", "") or "").strip()
+    if _gd_raw:
+        try:
+            gpu_device_val = max(0, int(_gd_raw))
+        except ValueError:
+            gpu_device_val = 0
+    engine, engine_config = _select_engine(use_gpu, cpu_threads_val, model_size, gpu_device_val)
     engine_kwargs = {}
     if engine:
         engine_kwargs["engine"] = engine
@@ -246,11 +254,27 @@ def init_ocr(args):
 
     # ─── 判断用 PP-OCRv6 还是 v5 ─────────────────────────
     if lang == "multilang_v6":
-        # 多语言 (v6)：PP-OCRv6 多语言模式，覆盖中/英/法/德/日/韩/俄
-        lang = "ch&en&fr&german&japan&korean&russian"
+        # 多语言混排（v6）：直接用 v6 通用字典。
+        # ⚠ 2026-10-09 真机实测（paddleocr 3.6.0 + paddlex 3.6.1）：
+        #   v6 分支显式指定了 model_name/model_dir，paddleocr 会忽略 lang
+        #   （UserWarning: "`lang` and `ocr_version` will be ignored when model
+        #    names or model directories are not `None`"），
+        #   字典固定来自 models/PP-OCRv6_*_rec_onnx/inference.yml 的
+        #   PostProcess.character_dict（18705 字：中英日 + 拉丁 462 + 希腊 76，
+        #   韩文/西里尔 0 覆盖）。同一张中英韩俄混排图，
+        #   lang="ch&en&fr&german&japan&korean&russian" 与 lang="ch" 识别结果逐行一致。
+        #   旧写法拼一长串是无效代码（唯一作用是触发 UserWarning），改为 ch 并在此说明。
+        lang = "ch"
     elif lang == "multilang_v5":
-        # 多语言 (v5)：PP-OCRv5 拉丁模型，覆盖 46 种拉丁语系语言
-        lang = "latin"
+        # 多语言 (v5)：PP-OCRv5 拉丁模型，覆盖 46 种拉丁语系语言。
+        # （v5 分支不传 model_dir，lang 真正参与模型选择 → latin_PP-OCRv5_mobile_rec）
+        # ⚠ 2026-10-09 实测（paddleocr 3.6.0）：paddleocr 的语言表里**没有字面 "latin"**
+        #   这个 lang（LATIN_LANGS 是具体语种集合，不含 "latin" 本身），
+        #   传 lang="latin" 会 ValueError: No models are available for
+        #   lang='latin' and ocr_version='PP-OCRv5' → 引擎初始化失败、界面无任何输出。
+        #   改传 "lb"（卢森堡文）：属于 LATIN_LANGS 且不在 PP-OCRv6 语言表里，
+        #   精确命中 latin_PP-OCRv5_mobile_rec（真机验证：英文图 0.9922 正常识别）。
+        lang = "lb"
     
     if lang in _V6_LANGS or "&" in lang:
         # PP-OCRv6 模型（从本地缓存加载）  
@@ -376,7 +400,7 @@ def main():
                         help="配置文件路径（可选，会覆盖 --language）")
     for p in ["limit_side_len", "cls", "det", "rec_batch_num",
              "shrink_poly_ratio", "blank_page_strategy",
-             "model_size", "lang", "cpu_threads"]:
+             "model_size", "lang", "cpu_threads", "gpu_device"]:
         parser.add_argument(f"--{p}", type=str, default="")
     args = parser.parse_args()
 

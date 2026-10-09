@@ -1,5 +1,5 @@
 """
-CathayOCR Lite (CathayOCR极速版) v1.3.0 - 纯 Vulkan 引擎PDF处理器
+CathayOCR Lite (轻量版) v1.3.0 - 纯 Vulkan 引擎PDF处理器
 Architecture: 预渲染所有页面到RAM -> 单实例OCR流水线 -> 组装输出
 核心思想: GPU永不等待,CPU预渲染消除I/O瓶颈
 =======================================================
@@ -42,10 +42,11 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog,
     QProgressBar, QGroupBox, QMessageBox, QSpinBox, QComboBox, QCheckBox,
     QRadioButton, QButtonGroup, QListWidget, QListWidgetItem, QTreeView,
-    QTextBrowser, QFrame
+    QTextBrowser, QFrame, QShortcut,
+    QSystemTrayIcon, QMenu, QAction, QStyle
 )
-from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QSettings
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QSettings, QEvent
+from PyQt5.QtGui import QFont, QKeySequence, QBrush, QColor, QIcon
 
 import fitz
 # 压制 MuPDF 的 PDF 结构语法警告（不影响识别结果）
@@ -137,6 +138,19 @@ def register_engine(engine_id, display_name, description, plugin_rel_path,
         'priority': priority,
     }
 
+
+def engine_display_name(engine_id, fallback=None):
+    """引擎内部 id → 界面统一显示名（取注册表里的 name）。
+
+    凡是给用户看的引擎名字一律走这里，保证下拉框 / 日志 / 提示口径一致，
+    不再直接暴露 ncnn_vulkan 这类内部 id。
+    """
+    info = ENGINE_REGISTRY.get(engine_id)
+    if info and info.get("name"):
+        return info["name"]
+    return fallback if fallback is not None else engine_id
+
+
 register_engine(
     'ncnn_vulkan', 'PP-OCR (ncnn Vulkan)',
     '\u2b50 速度最快！\n支持NVIDIA/AMD/Intel任意显卡\nGPU模式+Vulkan加速\nCPU模式+ncnn原生\n支持多版本模型（v3~v6）\n支持中/英/法/德/日/意/西/葡/希腊/多语言\n（韩/俄/阿拉伯/天城文等请用专业版）',
@@ -209,14 +223,14 @@ def _find_all_plugins():
 
         entry_path = found_path / entry
         if not entry_path.exists():
-            print(f"[Plugin] {eid}: entry not found at {entry_path}")
+            print(f"[Plugin] {engine_display_name(eid)}: 未找到入口程序，已跳过")
             continue
 
         found[eid] = {
             "plugin_dir": str(found_path),
             "entry_path": str(entry_path),
         }
-        print(f"[Plugin] Found {eid}: {found_path}")
+        print(f"[Plugin] 已加载引擎: {engine_display_name(eid)}")
 
     return found
 
@@ -232,7 +246,7 @@ def _init_plugin_dirs():
             ent = e["entry"]
             msg += "\n  - UmiOCR-data/plugins/" + rel + "/" + ent
         raise FileNotFoundError(msg)
-    print("[Plugin] 可用引擎: " + ", ".join(_PLUGIN_DIRS.keys()))
+    print("[Plugin] 可用引擎: " + ", ".join(engine_display_name(k) for k in _PLUGIN_DIRS))
 
 _init_plugin_dirs()
 
@@ -284,6 +298,155 @@ def _scan_available_ncnn_models(plugin_dir):
             has_bin = (base in bin_det and base in bin_rec)
             result.append((base, has_bin))
     return result
+
+
+# ============================================================
+# ncnn 字典 ↔ 模型 路由（唯一判定处；UI 与两处适配器共用，避免再次分叉）
+# ============================================================
+# rec 模型的输出维度（_rec.param 末尾 Gemm 8=）必须与所用字典的行数严格一致，
+# 不一致时引擎会在 1~2 次请求后永久卡死 / 输出乱码：
+#     PP_OCRv3_mobile_rec      6625  →  ppocr_keys_v1.txt        6625
+#     PP_OCRv4_mobile_rec      6625  →  ppocr_keys_v1.txt        6625   ← 旧代码错走 v5 字典
+#     PP_OCRv5_mobile_rec     18385  →  ppocr_keys_v5.txt       18385
+#     PP_OCRv5_server_rec     18385  →  ppocr_keys_v5.txt       18385
+#     PP_OCRv6_small_rec      18710  →  ppocr_keys_v6.txt       18710
+#     PP_OCRv6_medium_rec     18710  →  ppocr_keys_v6.txt       18710
+#     PP_OCRv6_tiny_rec        6906  →  ppocr_keys_v6_tiny.txt   6906   ← 旧代码错走 v6 字典
+def _ncnn_keys_file_for_model(model_base):
+    m = model_base or ""
+    if "v6_tiny" in m:                     # 必须先于 "v6" 判断
+        return "ppocr_keys_v6_tiny.txt"
+    if "v3" in m or "v4" in m:             # v4 与 v3 同用 v1 字典（输出维度都是 6625）
+        return "ppocr_keys_v1.txt"
+    if "v6" in m:
+        return "ppocr_keys_v6.txt"
+    return "ppocr_keys_v5.txt"             # v5_mobile / v5_server 及兜底
+
+
+# ============================================================
+# ncnn「语言 × 当前字典」覆盖判据
+# ============================================================
+# 语言下拉必须反映「当前模型实际用的那份字典」的真实能力 —— 四份字典差别很大：
+#   · 日文假名：v1 字典 4%、v6_tiny 字典 0%（v5/v6 是 100%）
+#   · 希腊文　：v1 字典 21%（v5/v6/v6_tiny 是 100%）
+#   · 越南文　：四份字典都只有 12%~41%（缺大量声调符号）
+# 档位：ok（正常）/ partial（可选中，标注可能缺重音）/ unsupported（灰显，不可选）
+_NCNN_PROBE_CJK    = "的一是不了在人有我他这为之大来以个中上们到说国和地也子时道出而要于就下得可你年生自"
+_NCNN_PROBE_KANA   = ("あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわをん"
+                      "アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン")
+_NCNN_PROBE_HANGUL = ("가나다라마바사아자차카타파하거너더러머버서어저처커터퍼허"
+                      "고노도로모보소오조초코토포호")
+_NCNN_PROBE_GREEK  = "ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩαβγδεζηθικλμνξοπρστυφχψω"
+_NCNN_PROBE_CYR    = "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЫЭЮЯабвгдежзийклмнопрстуфхцчшщыэюя"
+_NCNN_PROBE_ARAB   = "ابجدهوزحطيكلمنسعفصقرشتثخذضظغ"
+_NCNN_PROBE_DEVA   = "अआइईउऊएऐओऔकखगघचछजझटठडढणतथदधनपफबभमयरलवशषसह"
+_NCNN_PROBE_THAI   = "กขคงจฉชซญฎฏฐณดตถทธนบปผฝพฟมยรลวศษสหฬอฮ"
+_NCNN_PROBE_TELUGU = "అఆఇఈఉఊఎఏఐఒఓఔకఖగఘచఛజఝటఠడఢణతథదధనపఫబభమయరలవశషసహ"
+_NCNN_PROBE_TAMIL  = "அஆஇஈஉஊஎஏஐஒஓஔகஙசஜஞடணதநனபமயரறலளழவஶஷஸஹ"
+
+# 非拉丁语系：语言 → 其核心文字系探针（核心文字系缺失 = 该语言整个不支持）
+_NCNN_SCRIPT_PROBE = {
+    "ch": _NCNN_PROBE_CJK, "japan": _NCNN_PROBE_KANA, "korean": _NCNN_PROBE_HANGUL,
+    "el": _NCNN_PROBE_GREEK, "th": _NCNN_PROBE_THAI,
+    "te": _NCNN_PROBE_TELUGU, "ta": _NCNN_PROBE_TAMIL,
+}
+_NCNN_SCRIPT_PROBE.update({c: _NCNN_PROBE_CYR for c in (
+    "ru", "uk", "be", "bg", "mk", "mn", "kk", "ky", "tg", "tt", "ba", "cv", "rs_cyrillic")})
+_NCNN_SCRIPT_PROBE.update({c: _NCNN_PROBE_ARAB for c in (
+    "ar", "fa", "ug", "ur", "ps", "sd", "ks", "bal")})
+_NCNN_SCRIPT_PROBE.update({c: _NCNN_PROBE_DEVA for c in (
+    "hi", "mr", "ne", "sa", "bh", "mai", "kok")})
+
+# 拉丁语系：只记「该语言特有的带变音字母」（a-z 四份字典都有，不参与判定）
+_NCNN_LATIN_EXTRA = {
+    "fr": "àâæçéèêëîïôœùûüÿÀÂÆÇÉÈÊËÎÏÔŒÙÛÜŸ",
+    "de": "äöüßÄÖÜ",
+    "es": "áéíñóúü¿¡ÁÉÍÑÓÚÜ",
+    "pt": "áâãàçéêíóôõúüÁÂÃÀÇÉÊÍÓÔÕÚÜ",
+    "it": "àèéìòùÀÈÉÌÒÙ",
+    "nl": "àèéëïöüÀÈÉËÏÖÜ",
+    "ro": "ăâîșțşţĂÂÎȘȚŞŢ",
+    "ca": "àçèéíïòóúüÀÇÈÉÍÏÒÓÚÜ",
+    "gl": "áéíóúüñÁÉÍÓÚÜÑ",
+    "da": "æøåÆØÅ",
+    "sv": "åäöÅÄÖ",
+    "no": "æøåÆØÅ",
+    "fi": "äöåÄÖÅ",
+    "is": "áðéíóúýþæöÁÐÉÍÓÚÝÞÆÖ",
+    "pl": "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ",
+    "cs": "áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ",
+    "sk": "áäčďéíĺľňóôŕšťúýžÁÄČĎÉÍĹĽŇÓÔŔŠŤÚÝŽ",
+    "hu": "áéíóöőúüűÁÉÍÓÖŐÚÜŰ",
+    "hr": "čćđšžČĆĐŠŽ",
+    "sl": "čšžČŠŽ",
+    "bs": "čćđšžČĆĐŠŽ",
+    "rs_latin": "čćđšžČĆĐŠŽ",
+    "sq": "ëçËÇ",
+    "ga": "áéíóúÁÉÍÓÚ",
+    "cy": "ŵŷâêîôûŴŶÂÊÎÔÛ",
+    "et": "õäöüšžÕÄÖÜŠŽ",
+    "lt": "ąčęėįšųūžĄČĘĖĮŠŲŪŽ",
+    "lv": "āčēģīķļņšūžĀČĒĢĪĶĻŅŠŪŽ",
+    "mt": "ċġħżĊĠĦŻ",
+    "la": "æœÆŒ",
+    "pi": "āīūṭḍṇṃĀĪŪṬḌṆṂ",
+    "af": "áéíóúëÁÉÍÓÚË",
+    "az": "çğıöşüÇĞİÖŞÜ",
+    "uz": "ʻʼ",
+    "ku": "çêîşûÇÊÎŞÛ",
+    "eu": "ñÑ",
+    "oc": "àçèéíòóúÀÇÈÉÍÒÓÚ",
+    "vi": ("ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩị"
+           "óòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵĂÂĐÊÔƠƯ"),
+    "id": "àèéìòùÀÈÉÌÒÙ",
+    "ms": "àèéìòùÀÈÉÌÒÙ",
+    "tl": "ñáéíóúÑÁÉÍÓÚ",
+    "mi": "āēīōūĀĒĪŌŪ",
+    "tr": "çğıöşüÇĞİÖŞÜ",
+}
+
+_NCNN_DICT_POOL_CACHE = {}
+
+
+def _load_ncnn_dict_pool(plugin_dir, keys_file):
+    """读一份 ncnn 字典 → 字符集合（带缓存）。读不到返回空集，调用方据此不做判定。"""
+    key = (plugin_dir, keys_file)
+    if key not in _NCNN_DICT_POOL_CACHE:
+        pool = set()
+        try:
+            with open(os.path.join(plugin_dir, "models", keys_file),
+                      "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        pool.update(line)
+        except Exception as e:
+            print(f"[ncnn] 读字典失败 {keys_file}: {e}")
+        _NCNN_DICT_POOL_CACHE[key] = pool
+    return _NCNN_DICT_POOL_CACHE[key]
+
+
+def _ncnn_lang_tier(code, pool):
+    """按「当前模型用的那份字典」判断语言档位：'ok' / 'partial' / 'unsupported'。
+
+      · unsupported —— 核心文字系命中 < 60%（该文字系基本不在字典里，识别必乱码）
+      · partial     —— 特有字符命中 < 60%（认得了基础字母，但会缺重音/变音符号）
+      · ok          —— 覆盖良好
+    """
+    if not pool:
+        return "ok"                        # 字典没读到 → 不判定，避免误杀
+    script = _NCNN_SCRIPT_PROBE.get(code)
+    if script is not None:
+        u = set(script)
+        hit = sum(1 for c in u if c in pool) / len(u)
+        return "ok" if hit >= 0.6 else "unsupported"
+    extra = _NCNN_LATIN_EXTRA.get(code, "")
+    if extra:
+        u = set(extra)
+        hit = sum(1 for c in u if c in pool) / len(u)
+        if hit < 0.6:
+            return "partial"
+    return "ok"
 
 
 def _get_ncnn_model_options(engine_id):
@@ -570,7 +733,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         self.lock = threading.Lock()
         self.current_config = {}
         self._started = False
-        self._use_gpu = True  # 默认为GPU模式
+        self._use_gpu = True  # 适配器初值；实际由 params['use_gpu'] 覆盖（界面默认「自动(推荐)」）
         self._ocr_times = collections.deque(maxlen=20)  # 最近OCR耗时(秒)，用于自适应超时
 
     def set_port_offset(self, offset):
@@ -683,12 +846,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         # 字典必须按"实际选中的模型"(selected)选择，不能用传入的原始字符串：
         # 若传入短名(如 "medium")，selected 会回退到 available[0]（真实模型），
         # 此时仍按短名选字典会得到"v5字典 + v6模型"的不匹配 → 引擎 1~2 次请求后卡死。
-        if "v3" in selected:
-            keys_file = "ppocr_keys_v1.txt"
-        elif "v6" in selected:
-            keys_file = "ppocr_keys_v6.txt"
-        else:
-            keys_file = "ppocr_keys_v5.txt"
+        keys_file = _ncnn_keys_file_for_model(selected)
         return {
             "save": False,
             "det": {
@@ -754,12 +912,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         if lang != "chinese":
             print(f"[ncnn] Language: {lang} (model already supports all characters)")
         # 同 GPU 分支：字典必须跟随实际选中的模型(selected)，避免字典与模型不匹配
-        if "v3" in selected:
-            keys_file = "ppocr_keys_v1.txt"
-        elif "v6" in selected:
-            keys_file = "ppocr_keys_v6.txt"
-        else:
-            keys_file = "ppocr_keys_v5.txt"
+        keys_file = _ncnn_keys_file_for_model(selected)
         return {
             "save": False,
             "det": {
@@ -1107,7 +1260,7 @@ class OCRClient:
                     a.close()
                 raise RuntimeError(f"引擎实例{i+1}启动失败: {err}")
             self._instances.append(adapter)
-            print(f"[OCRClient] 实例{i+1}就绪: {engine_id} | GPU={use_gpu} | 边长={limit_side_len} | 模型={model_size}")
+            print(f"[OCRClient] 实例{i+1}就绪: {engine_display_name(engine_id)} | GPU={use_gpu} | 边长={limit_side_len} | 模型={model_size}")
         self.adapter = self._instances[0]
         self._initialized = True
 
@@ -1653,69 +1806,283 @@ class BatchWorkerThread(QThread):
             self.processor.resume()
 
 # ============================================================
+# 迷你窗口：处理中把两个窗口收成一张右下角的小进度卡
+# ============================================================
+class MiniWindow(QWidget):
+    """超小卡片式进度窗 —— 只显示 当前文件 / 总文件数 / 已处理文件数 / 总进度。
+
+    设计约定（2026-10-09 第 13 批）：
+      * 无边框 + 置顶 + 圆角卡片，默认贴屏幕右下角（避开任务栏）；
+      * 按住卡片任意位置可拖动；「恢复」按钮 / 双击卡片 / 任务栏图标都能回到完整窗口；
+      * 数据全部由主窗口推过来（set_state），自己不碰任何业务逻辑 —— 纯 UI。
+    """
+    restore_requested = pyqtSignal()
+    on_top_changed = pyqtSignal(bool)      # 置顶开关变化（主窗口负责记住这个选择）
+    CARD_W, CARD_H = 420, 118
+
+    def __init__(self):
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setWindowTitle("CathayOCR — 迷你进度窗")
+        self.setFixedSize(self.CARD_W, self.CARD_H)
+        self._drag = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(9, 9, 9, 9)
+        card = QFrame(self)
+        card.setObjectName("miniCard")
+        card.setStyleSheet("QFrame#miniCard{background:#ffffff;border:1px solid #e2e8f0;"
+                           "border-radius:12px;}")
+        outer.addWidget(card)
+        try:
+            from PyQt5.QtWidgets import QGraphicsDropShadowEffect
+            eff = QGraphicsDropShadowEffect(card)
+            eff.setBlurRadius(16)
+            eff.setOffset(0, 3)
+            eff.setColor(QColor(15, 23, 42, 60))
+            card.setGraphicsEffect(eff)
+        except Exception:
+            pass
+
+        v = QVBoxLayout(card)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(7)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self.dot = QLabel("●")
+        self.dot.setStyleSheet("color:#1a73e8;font-size:12px;")
+        top.addWidget(self.dot)
+        self.app_label = QLabel("CathayOCR")
+        self.app_label.setStyleSheet("color:#1f2d3d;font-size:11px;font-weight:bold;")
+        top.addWidget(self.app_label)
+        self.state_label = QLabel("")
+        self.state_label.setStyleSheet("color:#8a97a6;font-size:10px;")
+        top.addWidget(self.state_label)
+        top.addStretch()
+        self.pin_btn = QPushButton("📌")
+        self.pin_btn.setCheckable(True)
+        self.pin_btn.setChecked(True)                 # 默认置顶
+        self.pin_btn.setCursor(Qt.PointingHandCursor)
+        self.pin_btn.setFixedWidth(28)
+        self.pin_btn.setStyleSheet(
+            "QPushButton{border:none;background:#f1f5f9;color:#94a3b8;"
+            "border-radius:9px;padding:2px 4px;font-size:10px;}"
+            "QPushButton:hover{background:#e2e8f0;color:#334155;}"
+            "QPushButton:checked{background:#1a73e8;color:#ffffff;}")
+        self.pin_btn.setToolTip("已置顶：点一下取消置顶")
+        self.pin_btn.toggled.connect(self.set_on_top)
+        top.addWidget(self.pin_btn)
+        self.restore_btn = QPushButton("恢复")
+        self.restore_btn.setCursor(Qt.PointingHandCursor)
+        self.restore_btn.setToolTip("回到完整窗口（也可以双击本卡片，或点任务栏上的图标）")
+        self.restore_btn.setStyleSheet(
+            "QPushButton{border:none;background:#eaf1fb;color:#1a73e8;"
+            "border-radius:9px;padding:2px 12px;font-size:10px;}"
+            "QPushButton:hover{background:#1a73e8;color:#ffffff;}")
+        self.restore_btn.clicked.connect(self.restore_requested.emit)
+        top.addWidget(self.restore_btn)
+        v.addLayout(top)
+
+        self.file_label = QLabel("—")
+        self.file_label.setStyleSheet("color:#334155;font-size:11px;")
+        v.addWidget(self.file_label)
+
+        row = QHBoxLayout()
+        row.setSpacing(9)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(8)
+        self.bar.setStyleSheet(
+            "QProgressBar{background:#eef2f7;border:none;border-radius:4px;}"
+            "QProgressBar::chunk{background:#1a73e8;border-radius:4px;}")
+        row.addWidget(self.bar, 1)
+        self.count_label = QLabel("— / —")
+        self.count_label.setStyleSheet("color:#5b6b7c;font-size:10px;")
+        self.count_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.count_label.setMinimumWidth(96)
+        row.addWidget(self.count_label)
+        v.addLayout(row)
+
+    # ---------- 对外接口 ----------
+    def set_state(self, app_name, file_name, done, total, pct, processing):
+        """刷新卡片内容。processing=False 时显示「等待用户安排 OCR 任务」。"""
+        try:
+            self.app_label.setText(str(app_name))
+        except Exception:
+            pass
+        self.state_label.setText("正在识别…" if processing else "等待用户安排 OCR 任务")
+        name = str(file_name or "—")
+        budget = self.CARD_W - 2 * 9 - 2 * 14 - 10
+        try:
+            name = self.file_label.fontMetrics().elidedText(name, Qt.ElideMiddle, budget)
+        except Exception:
+            pass
+        self.file_label.setText(("📄 " + name) if processing else name)
+        self.file_label.setToolTip(str(file_name or ""))
+        try:
+            self.bar.setValue(max(0, min(1000, int(float(pct) * 1000))))
+        except Exception:
+            self.bar.setValue(0)
+        if total > 0:
+            self.count_label.setText("已处理 %d / %d" % (done, total))
+        else:
+            self.count_label.setText("— / —")
+        try:
+            self.setToolTip("%s\n%s\n已处理 %d / %d 个文件（%.0f%%）"
+                            % (app_name, file_name, done, total, float(pct) * 100))
+        except Exception:
+            pass
+
+    def set_on_top(self, on, notify=True):
+        """手动置顶 / 取消置顶。
+
+        Qt 的 setWindowFlags() 会把窗口先隐藏，所以改完必须重新 show 一次；
+        这里同时把几何位置补回去，免得卡片跳回屏幕左上角。
+        """
+        try:
+            on = bool(on)
+            flags = self.windowFlags()
+            new_flags = (flags | Qt.WindowStaysOnTopHint) if on \
+                else (flags & ~Qt.WindowStaysOnTopHint)
+            if new_flags != flags:
+                was_visible = self.isVisible()
+                geo = self.geometry()
+                self.setWindowFlags(new_flags)
+                self.setGeometry(geo)
+                if was_visible:
+                    self.show()
+                    self.raise_()
+            self.pin_btn.blockSignals(True)
+            self.pin_btn.setChecked(on)
+            self.pin_btn.blockSignals(False)
+            self.pin_btn.setToolTip("已置顶：点一下取消置顶" if on
+                                    else "未置顶：点一下置顶")
+        except Exception as e:
+            print("[Mini] 切换置顶失败: %s" % e)
+        if notify:
+            try:
+                self.on_top_changed.emit(on)
+            except Exception:
+                pass
+
+    def show_at_bottom_right(self):
+        """贴到屏幕右下角（用可用区域，自动避开任务栏）。"""
+        try:
+            g = QApplication.primaryScreen().availableGeometry()
+            self.move(max(g.left(), g.right() - self.width() - 16),
+                      max(g.top(), g.bottom() - self.height() - 16))
+        except Exception:
+            pass
+        self.show()
+        self.raise_()
+
+    # ---------- 拖动 / 双击还原 ----------
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag = e.globalPos() - self.frameGeometry().topLeft()
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and (e.buttons() & Qt.LeftButton):
+            self.move(e.globalPos() - self._drag)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+
+    def mouseDoubleClickEvent(self, e):
+        self.restore_requested.emit()
+
+
+# ============================================================
 # Main Window
 # ============================================================
 
 class MainWindow(QMainWindow):
-    # ── 主语言列表（显示名 → 代码） ──
+    # ── 主语言列表（显示名 → 语言代码） ──
+    # 顺序 = 下拉里的显示顺序：先放轻量版支持的，再放需专业版的（见 _lang_combo_codes）。
+    # ⚠ 这里**故意不逐条罗列拉丁语系语言**：v6 通用字典实测含约 400 个带重音拉丁字母
+    #   （拉丁-1补充 64 + 拉丁扩展A 128 + 拉丁扩展B 208），实际覆盖「所有拉丁字母语言」；
+    #   逐条列反而会让人以为只支持列出的那几种。
     _LANG_ITEMS = [
-        # ── 核心语言 ──
+        # ── 轻量版支持（ncnn v6 通用字典实测覆盖） ──
         ("中文 (Chinese)", "ch"),
+        ("日本語 (日文)", "japan"),
         ("English (英文)", "en"),
         ("Français (法文)", "fr"),
         ("Deutsch (德文)", "de"),
-        ("日本語 (日文)", "japan"),
-        ("한국어 (韩文)", "korean"),
         ("Español (西班牙文)", "es"),
         ("Italiano (意大利文)", "it"),
         ("Português (葡萄牙文)", "pt"),
-        ("Pусский (俄文)", "ru"),
-        ("Tiếng Việt (越南文)", "vi"),
-
-        # ── 其他常用 ──
         ("Nederlands (荷兰文)", "nl"),
         ("Polski (波兰文)", "pl"),
         ("Magyar (匈牙利文)", "hu"),
         ("Čeština (捷克文)", "cs"),
+        ("Tiếng Việt (越南文)", "vi"),
+        ("Ελληνικά (希腊文)", "el"),
+        ("多语言混排 (中·英·日 + 拉丁语系)", "multilang_v6"),
 
-        # ── 多语言混排 ──
-        ("多语言混排 (中·英·日 + 拉丁语系)", "ch&en&fr&de&ja&ko&..."),
+        # ── 需专业版（ncnn v6 字典 0 覆盖，选了必乱码） ──
+        ("한국어 (韩文)", "korean"),
+        ("Pусский (俄文)", "ru"),
     ]
 
-    # ── 简单模式语言列表 ──
-    #   ✅ 轻量版支持 = PP-OCRv6 通用字典覆盖：中文 / 英文 / 日文 / 拉丁语系 / 希腊文 / 中英日拉丁混排
-    #   ❌ 需专业版   = 字典 0 覆盖（实测逐字符核对）：韩文 / 西里尔 / 阿拉伯 / 天城文 / 泰 / 泰卢固 / 泰米尔
-    #   顺序上把"支持"的排前面，用一条分隔行隔开，灰显项 = 轻量版识别会乱码
+    # 语言支持范围不常驻界面（太占地方），写进下拉的悬停 tooltip。
+    # 依据：实测 ncnn 的 models/ppocr_keys_v6.txt（18709 条）
+    #   CJK 汉字 15565 + 扩展A 137 · 日文假名 180 · 希腊 76 · 带重音拉丁字母约 400 ✅
+    #   韩文谚文 0 · 西里尔 0 · 阿拉伯 0 · 天城文 0 · 泰/泰卢固/泰米尔 0 ❌
+    # 需专业版的项在显示名后加这个后缀，把「为什么灰」直接写在字面上，不用悬停猜
+    _LITE_UNSUPPORTED_SUFFIX = "（需专业版）"
+    # 「模型级不支持」后缀：该文字系不在「当前模型所用的那份字典」里 → 灰显、不可选
+    _LITE_MODEL_UNSUPPORTED_SUFFIX = "（此模型不支持）"
+    # 「部分支持」后缀：字典只覆盖基础字母，会缺重音/变音符号 → 仍可选中
+    _LITE_PARTIAL_SUFFIX = "（部分支持·可能缺重音）"
+
+    # ── 简单模式语言列表：(显示名, 语言代码) ──
+    #   支持的排前面，用一条分隔行隔开，灰显项 = 轻量版识别会乱码
     _SIMPLE_LANG_SEP = "__NEED_PRO__"
     _SIMPLE_LANG_ITEMS = [
-        ("中文", "ch", "中文 (Chinese)"),
-        ("英文", "en", "English (英文)"),
-        ("日文", "japan", "日本語 (日文)"),
-        ("拉丁语系 (法·德·西·意·葡等)", "fr", "Français (法文)"),
-        ("希腊文", "el", "Ελληνικά (希腊文)"),
-        ("多语言混排 (中·英·日 + 拉丁语系)", "multilang_v6", "多语言混排 (中·英·日 + 拉丁语系)"),
-        ("───── 以下文字需专业版 ─────", _SIMPLE_LANG_SEP, ""),
-        ("韩文", "korean", "한국어 (韩文)"),
-        ("西里尔文系 (俄/乌/保等)", "ru", "Pусский (俄文)"),
-        ("阿拉伯文系 (阿/波/维/乌等)", "ar", "العربية (阿拉伯文)"),
-        ("天城文系 (印地/马拉地等)", "hi", "हिन्दी (印地文)"),
-        ("泰文", "th", "ภาษาไทย (泰文)"),
-        ("泰卢固文", "te", "తెలుగు (泰卢固文)"),
-        ("泰米尔文", "ta", "தமிழ் (泰米尔文)"),
+        # ── 轻量版支持 ──
+        ("中文（简体 / 繁体）", "ch"),
+        ("日文（含假名）", "japan"),
+        ("英文 English", "en"),
+        ("拉丁字母语言（法·德·西·意·葡·荷·波·捷·匈·土·越 等）", "fr"),
+        ("希腊文", "el"),
+        ("中·英·日·拉丁 混排", "multilang_v6"),
+        # ── 需专业版 ──
+        ("───────── 以下文字需专业版 ─────────", _SIMPLE_LANG_SEP),
+        ("韩文（谚文）" + _LITE_UNSUPPORTED_SUFFIX, "korean"),
+        ("西里尔文系（俄 / 乌 / 保 等）" + _LITE_UNSUPPORTED_SUFFIX, "ru"),
+        ("阿拉伯文系（阿 / 波 / 维 / 乌 等）" + _LITE_UNSUPPORTED_SUFFIX, "ar"),
+        ("天城文系（印地 / 马拉地 等）" + _LITE_UNSUPPORTED_SUFFIX, "hi"),
+        ("泰文" + _LITE_UNSUPPORTED_SUFFIX, "th"),
+        ("泰卢固文" + _LITE_UNSUPPORTED_SUFFIX, "te"),
+        ("泰米尔文" + _LITE_UNSUPPORTED_SUFFIX, "ta"),
     ]
     _LITE_UNSUPPORTED_GROUPS = {"korean", "ru", "ar", "hi", "th", "te", "ta"}
-    # 专业模式语言下拉灰显黑名单。
-    # Lite 恒用 ncnn Vulkan；上面的 _LANG_ITEMS 是「精选 15 项」，其中不被
-    # ncnn 字典覆盖的只有 韩文 与 俄文（西里尔）—— 这两项灰显并提示「请使用专业版」。
-    # 依据实测 ncnn 的 v6 字典 models/ppocr_keys_v6.txt（18709 字）：
-    #   CJK 15565 · 假名 180 · 拉丁 52 · 希腊 76 ✅   韩文 0 · 西里尔 0 ❌
+    # 专业模式语言下拉的灰显黑名单：_LANG_ITEMS 里 v6 字典 0 覆盖的那两项。
+    # （Lite 恒用 ncnn Vulkan，字典由「模型」决定：默认 v6 模型 → ppocr_keys_v6.txt）
     _LITE_UNSUPPORTED_CODES = {
         "korean", "ru",
     }
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CathayOCR Lite (极速版) - PDF OCR处理器")
+        self.setWindowTitle("CathayOCR Lite (轻量版) - PDF OCR处理器")
+        # ── 系统托盘：只作「显示 / 退出」入口，不接管最小化（详见 _setup_tray）──
+        self._tray = None
+        self._quitting = False
+        # ── 迷你窗口：处理中把两个窗口收成一张右下角小进度卡（详见 MiniWindow）──
+        self._mini = None
+        self._mini_active = False
+        self._mini_prev_state = Qt.WindowNoState
+        self._current_file_name = "—"
+        self._set_app_icon()
+        # 处理中标志：为 True 时禁止一切会改变识别配置的操作
+        # （含「简单模式 ↔ 专业模式」切换、语言/显卡/输出目录修改、往列表加文件）
+        self._processing = False
         self.setGeometry(100, 100, 1100, 850)
         self.cfg = QSettings("QClaw", "PDFOCRProcessor")
         central = QWidget()
@@ -1741,6 +2108,19 @@ class MainWindow(QMainWindow):
         hint_label = QLabel("简单模式：回答3个问题自动设置 | 专业模式：全部参数自由调节")
         hint_label.setStyleSheet("color: #888; font-size: 11px;")
         ms_layout.addWidget(hint_label)
+        # ── 「迷你窗口」：处理中把主窗口 + 日志窗口收成一张右下角小进度卡（纯 UI）──
+        self.mini_btn = QPushButton("🗕 迷你窗口")
+        self.mini_btn.setCursor(Qt.PointingHandCursor)
+        self.mini_btn.setStyleSheet(
+            "QPushButton{border:1px solid #cfd6dd;border-radius:4px;padding:3px 10px;"
+            "background:#f5f7f9;color:#4a5a6a;}"
+            "QPushButton:hover{background:#1a73e8;color:#ffffff;border-color:#1a73e8;}")
+        self.mini_btn.setToolTip(
+            "把主窗口和运行日志窗口收成右下角一张小进度卡，\n"
+            "只显示当前文件 / 总文件数 / 已处理文件数和进度条。\n"
+            "处理结束或点卡片上的「恢复」会自动还原（不影响识别功能）")
+        self.mini_btn.clicked.connect(self.enter_mini_mode)
+        ms_layout.addWidget(self.mini_btn)
         self.ui_simple_btn.toggled.connect(self._on_ui_mode_changed)
         layout.addWidget(ms_widget)
 
@@ -1814,10 +2194,10 @@ class MainWindow(QMainWindow):
         r4 = QHBoxLayout()
         r4.addWidget(QLabel("🌐 文档语言"))
         self.simple_lang = QComboBox()
-        for _disp, _code, _full in self._SIMPLE_LANG_ITEMS:
-            self.simple_lang.addItem(_disp)
+        for _disp, _code in self._SIMPLE_LANG_ITEMS:
+            self.simple_lang.addItem(_disp, _code)
         _lm = self.simple_lang.model()
-        for _i, (_disp, _code, _full) in enumerate(self._SIMPLE_LANG_ITEMS):
+        for _i, (_disp, _code) in enumerate(self._SIMPLE_LANG_ITEMS):
             if _code == self._SIMPLE_LANG_SEP:
                 _lm.item(_i).setEnabled(False)  # 分隔行：只作分界提示，不可选
                 self.simple_lang.setItemData(_i, "分隔行：其下文字轻量版不支持", Qt.ToolTipRole)
@@ -1831,19 +2211,18 @@ class MainWindow(QMainWindow):
                     Qt.ToolTipRole)
         self.simple_lang.setMinimumWidth(300)
         self.simple_lang.setMaxVisibleItems(20)
-        self.simple_lang.setToolTip("灰显项为轻量版不支持的文字（需专业版引擎）；选择语言只影响所用的模型/词典")
+        self.simple_lang.setToolTip(
+            "选择文档里会出现哪些文字。\n"
+            "（轻量版只有 ncnn 引擎：认得出什么由「模型」决定，语言本身不改变识别结果）\n"
+            "✅ 支持：汉字（简/繁）· 日文假名 · 所有拉丁字母语言 · 希腊文\n"
+            "❌ 需专业版：韩文 · 西里尔文（俄等）· 阿拉伯文 · 天城文 · 泰文 · 泰卢固文 · 泰米尔文\n"
+            "带「（需专业版）」的灰显项 = ncnn 字典 0 覆盖，选了也认不出。\n"
+            "💡 中文/拉丁/日文字符都在同一份字典里（中文字典本身含整套拉丁字母），\n"
+            "   所以中英混排直接选「中文」即可，不必切到英文。\n"
+            "注：拉丁字母语言只列了常用的几种，实际所有用拉丁字母的语言都支持。")
         r4.addWidget(self.simple_lang)
         r4.addStretch()
         sl.addLayout(r4)
-
-        # 支持范围说明（把"能识别哪些文字"写清楚）
-        self.simple_lang_hint = QLabel(
-            "✅ 轻量版支持：中文 · 英文 · 日文 · 拉丁语系（法/德/西/意/葡等）· 希腊文 · 中英日拉丁混排\n"
-            "❌ 需专业版：韩文 · 俄文等西里尔文 · 阿拉伯文 · 印地文等天城文 · 泰文 · 泰卢固文 · 泰米尔文"
-        )
-        self.simple_lang_hint.setStyleSheet("color: #777; font-size: 11px;")
-        self.simple_lang_hint.setWordWrap(True)
-        sl.addWidget(self.simple_lang_hint)
 
         # 配置摘要（一行灰色小字）
         self.simple_preview = QLabel()
@@ -1867,13 +2246,15 @@ class MainWindow(QMainWindow):
         self._expert_groups.append(eg)
         el = QHBoxLayout(eg)
         el.addWidget(QLabel("引擎:"))
-        self.engine_combo = QLabel("PP-OCR (ncnn) — CathayOCR Lite")
+        self.engine_combo = QLabel(engine_display_name("ncnn_vulkan") + " — CathayOCR Lite")
         self.engine_combo.setToolTip(
-            "CathayOCR Lite (极速版)\n"
+            "CathayOCR Lite (轻量版)\n"
             "GPU模式+Vulkan加速 | CPU模式+ncnn原生\n"
             "支持NVIDIA/AMD/Intel任意显卡\n"
-            "支持中/英/法/德/日/意/西/葡/希腊/多语言\n"
-            "（韩/俄/阿拉伯/天城文等请用专业版）\n"
+            "✅ 支持：汉字（简/繁）· 日文假名 · 所有拉丁字母语言\n"
+            "        （英/法/德/西/意/葡/荷/波/捷/匈/土/越 等，含带重音字母）· 希腊文\n"
+            "❌ 需专业版：韩文 · 西里尔文（俄/乌/保）· 阿拉伯文 · 天城文（印地）\n"
+            "          · 泰文 · 泰卢固文 · 泰米尔文\n"
             "支持多版本模型(v3~v6)"
         )
         self.engine_combo.currentData = lambda rid='ncnn_vulkan': rid
@@ -1898,22 +2279,34 @@ class MainWindow(QMainWindow):
             "选择OCR模型版本:\n"
             "  medium (推荐) = 精度与速度最佳平衡\n"
             "  small         = 速度更快但精度稍低\n"
-            "  同一引擎下，改模型不依赖网络下载"
+            "  同一引擎下，改模型不依赖网络下载\n"
+            "  ⚠ 模型决定用哪份字典，语言列表会随之变化"
         )
+        # 切模型 → 所用字典变了 → 语言列表必须跟着重建
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
         el.addWidget(self.model_combo)
         el.addStretch()
         el.addWidget(QLabel("语言:"))
         self.lang_combo = QComboBox()
-        self.lang_combo.setMinimumWidth(100)
-        self.lang_combo.setMaxVisibleItems(20)
-        self.lang_combo.addItems(["中文", "English", "Français", "Deutsch", "日本語", "多语言"])
+        self.lang_combo.setMinimumWidth(260)
+        self.lang_combo.setMaxVisibleItems(24)
+        # 条目由 _update_lang_combo 在建窗末尾统一填充（支持项在前、需专业版在后并加后缀）
         self.lang_combo.setToolTip(
-            "选择识别语言:\n"
-            "  ncnn PP-OCRv6 通用字典：汉字 + 日文假名 + 拉丁 + 希腊字符\n"
-            "  （实测不含 韩文/西里尔/阿拉伯/天城文/泰系 → 需专业版）\n"
-            "  \"中文 (Chinese)\" = 繁简体中文自动识别\n"
-            "  \"多语言混排 (中·英·日 + 拉丁语系)\" = 用完整字典(18707字符)覆盖轻量版支持的全部文字"
+            "选择识别语言（轻量版 = ncnn 单一引擎）：\n"
+            "  · 语言只用来声明「文档里会出现哪些文字」；真正决定认得出什么的是【模型】——\n"
+            "    字典跟着模型走，多个语言**共用同一份字典**：\n"
+            "      v6 模型 → v6 通用字典 / v5 模型 → v5 字典 / v3·v4 模型 → v1 字典。\n"
+            "    所以同一次运行里，在这些语种之间来回切，识别结果不会变。\n"
+            "  · 默认 PP-OCRv6 模型覆盖：汉字（简/繁）+ 日文假名 + 所有拉丁字母语言 + 希腊文。\n"
+            "  · 带「（需专业版）」的灰显项 = 四份 ncnn 字典实测 0 覆盖（识别必乱码），需换专业版。\n"
+            "  · 若把模型换成 v5 / v4 / v3，拉丁带重音字母的覆盖会明显变窄。\n"
+            "\n"
+            "💡 「中文模式能不能认英文？」能 —— 中文字典本身就内置整套拉丁字母\n"
+            "   （v6 通用字典 462 个拉丁字符、v5 字典 145 个、v1 字典 86 个，a-z/A-Z/0-9 都齐全）。\n"
+            "   所以中英混排文档直接选「中文」即可；只是纯英文时专门的拉丁/英文模型精度更好。\n"
+            "  ⚠ 选中模型不同时，本提示下方会列出该模型实际用的字典与被排掉的文字系。"
         )
+        self._lang_tip_base = self.lang_combo.toolTip()   # 语言框 tooltip 会随模型改写
         self.lang_combo.currentIndexChanged.connect(self._on_lang_changed)
         el.addWidget(self.lang_combo)
         el.addStretch()
@@ -2061,6 +2454,9 @@ class MainWindow(QMainWindow):
         ml.addLayout(mr)
         self.file_list = QListWidget()
         self.file_list.setMaximumHeight(100)
+        # 支持 Ctrl / Shift 多选，便于批量删除
+        self.file_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.file_list.setToolTip("支持 Ctrl / Shift 多选；选中后按 Delete 键可删除")
         ml.addWidget(QLabel("待处理文件列表:"))
         ml.addWidget(self.file_list)
         fb = QHBoxLayout()
@@ -2076,19 +2472,37 @@ class MainWindow(QMainWindow):
         self.clear_files_btn = QPushButton("清空列表")
         self.clear_files_btn.clicked.connect(self.clear_files)
         fb.addWidget(self.clear_files_btn)
+        self.remove_sel_btn = QPushButton("删除选中")
+        self.remove_sel_btn.setToolTip(
+            "从待处理列表移除选中的文件（按住 Ctrl / Shift 可多选）\n"
+            "只移除列表条目，不会删除磁盘上的任何文件")
+        self.remove_sel_btn.clicked.connect(self.remove_selected_files)
+        fb.addWidget(self.remove_sel_btn)
+        self.prune_done_btn = QPushButton("剔除已完成")
+        self.prune_done_btn.setToolTip(
+            "一次性移除「目标目录里已经有 _result.txt + _layered.pdf」的文件\n"
+            "（用于中断后重跑：只跑还没导出的那些）\n"
+            "只移除列表条目，不会删除任何文件")
+        self.prune_done_btn.clicked.connect(self.prune_completed_files)
+        fb.addWidget(self.prune_done_btn)
         ml.addLayout(fb)
+        # 选中列表项后按 Delete 键 = 删除选中（仅在列表获得焦点时生效）
+        _del_sc = QShortcut(QKeySequence.Delete, self.file_list, self.remove_selected_files)
+        _del_sc.setContext(Qt.WidgetWithChildrenShortcut)
         layout.addWidget(mg)
 
         # === 输出 ===
         og2 = QGroupBox("输出目录")
         ol2 = QHBoxLayout(og2)
         self.output_edit = QLineEdit()
-        if self._last_output_dir:
-            self.output_edit.setText(self._last_output_dir)
+        # 输出目录默认留空 = 输出到每个 PDF 自己所在的目录。
+        # 不用上次记住的路径回填：否则「默认值」实际是个旧路径，容易误导出到别处。
+        # 上次用过的目录仍记在 _last_output_dir，只作为「浏览」对话框的起始位置。
+        self.output_edit.setPlaceholderText("留空 = 输出到每个 PDF 所在的目录（原目录）")
         ol2.addWidget(self.output_edit)
-        ob = QPushButton("浏览...")
-        ob.clicked.connect(self.browse_output)
-        ol2.addWidget(ob)
+        self.browse_output_btn = QPushButton("浏览...")
+        self.browse_output_btn.clicked.connect(self.browse_output)
+        ol2.addWidget(self.browse_output_btn)
         layout.addWidget(og2)
 
         # === 进度 ===
@@ -2173,6 +2587,11 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
+        # 处理中不接受拖入：列表内容已被本次任务取走，再往里加会造成
+        # 「任务跑的是旧列表、界面显示的是新列表」的错位
+        if self._processing:
+            self.log("⚠ 处理中：不接受拖入文件（等本批跑完或先停止）")
+            return
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path.lower().endswith('.pdf'):
@@ -2181,6 +2600,8 @@ class MainWindow(QMainWindow):
                 self._add_pdf_from_folder(path)
 
     def _add_file(self, path):
+        if self._processing:
+            return
         for i in range(self.file_list.count()):
             if self.file_list.item(i).data(Qt.UserRole) == path:
                 return
@@ -2283,6 +2704,19 @@ class MainWindow(QMainWindow):
 
     def _on_ui_mode_changed(self, simple_mode):
         """切换简单模式/专业模式"""
+        # 【安全闸】处理中禁止切换界面模式。
+        # 切到简单模式会走 _sync_simple_from_expert → _apply_simple_settings，
+        # 直接改写模型/显卡/边长等参数；而这些参数已被 BatchWorkerThread 取走用于
+        # 正在跑的任务，界面显示与任务实际参数会就此分叉。这里拦掉并还原单选按钮。
+        if self._processing:
+            self.ui_simple_btn.blockSignals(True)
+            self.ui_expert_btn.blockSignals(True)
+            self.ui_simple_btn.setChecked(not simple_mode)
+            self.ui_expert_btn.setChecked(simple_mode)
+            self.ui_simple_btn.blockSignals(False)
+            self.ui_expert_btn.blockSignals(False)
+            self.log("⚠ 处理中：不能切换「简单模式 / 专业模式」")
+            return
         is_simple = self.ui_simple_btn.isChecked()
         self.simple_group.setVisible(is_simple)
         for w in self._expert_groups:
@@ -2322,9 +2756,9 @@ class MainWindow(QMainWindow):
             self.simple_doc.setCurrentIndex(2)  # 扫描件
         else:
             self.simple_doc.setCurrentIndex(0)  # 普通文档
-        # 语言：专业模式完整项 → 按代码归并到简单模式组；不支持的文字回落到"中文"
-        lang_text = self.lang_combo.currentText()
-        _pro_code = dict(self._LANG_ITEMS).get(lang_text, "ch")
+        # 语言：专业模式的语言代码 → 归并到简单模式的组；不支持的文字回落到"中文"
+        # 直接读 itemData（不再靠显示文本反查：文本带「（需专业版）」后缀会对不上）
+        _pro_code = self.lang_combo.currentData() or "ch"
         _LATIN_SIMPLE = {"fr", "de", "es", "it", "pt", "nl", "ro", "ca", "gl", "da", "sv",
                          "no", "fi", "is", "pl", "cs", "sk", "hu", "hr", "sl", "bs",
                          "rs_latin", "sq", "ga", "cy", "et", "lt", "lv", "mt", "la", "pi",
@@ -2332,14 +2766,10 @@ class MainWindow(QMainWindow):
                          "mi", "tr"}
         if _pro_code in _LATIN_SIMPLE:
             _pro_code = "fr"
-        elif _pro_code == "ch&en&fr&de&ja&ko&...":
-            _pro_code = "multilang_v6"
-        _grp_disp = next((_d for _d, _c, _f in self._SIMPLE_LANG_ITEMS
-                          if _c == _pro_code and _c != self._SIMPLE_LANG_SEP), None)
-        if _grp_disp is None or _pro_code in self._LITE_UNSUPPORTED_GROUPS:
-            _grp_disp = "中文"  # 灰显项不可落在简单模式里，回落中文
-        lang_idx = self.simple_lang.findText(_grp_disp)
-        self.simple_lang.setCurrentIndex(lang_idx if lang_idx >= 0 else 0)
+        if _pro_code in self._LITE_UNSUPPORTED_GROUPS:
+            _pro_code = "ch"  # 灰显项不可落在简单模式里，回落中文
+        _si = self.simple_lang.findData(_pro_code)
+        self.simple_lang.setCurrentIndex(_si if _si >= 0 else 0)
 
         self.simple_gpu.blockSignals(False)
         self.simple_speed.blockSignals(False)
@@ -2360,6 +2790,9 @@ class MainWindow(QMainWindow):
 
     def _apply_simple_settings(self):
         """将简单模式的3个选择应用到实际参数"""
+        # 【安全闸】处理中禁止改写识别参数（同 _on_ui_mode_changed 的理由）
+        if self._processing:
+            return
         doc_idx = self.simple_doc.currentIndex()
         speed_idx = self.simple_speed.currentIndex()
         gpu_idx = self.simple_gpu.currentIndex()
@@ -2434,19 +2867,20 @@ class MainWindow(QMainWindow):
         self.vertical_check.setChecked(target_vertical)
         self.angle_cls_check.setChecked(target_angle)
         self.dual_check.setChecked(target_dual)
-        # 语言同步（分隔行 / 灰显的"需专业版"项 → 回落中文）
+        # 语言同步：简单模式的语言代码 → 专业模式下拉（按代码定位，不再靠显示文本；
+        # 旧代码用 findText 匹配显示文本，导致「希腊文」在专业模式语言表里找不到 → 悄悄按中文跑）
         _li = self.simple_lang.currentIndex()
         _entry = self._SIMPLE_LANG_ITEMS[_li] if 0 <= _li < len(self._SIMPLE_LANG_ITEMS) else None
         if (_entry is None or _entry[1] == self._SIMPLE_LANG_SEP
                 or _entry[1] in self._LITE_UNSUPPORTED_GROUPS):
-            _full = "中文 (Chinese)"
+            _code = "ch"
             self.simple_lang.blockSignals(True)
             self.simple_lang.setCurrentIndex(0)
             self.simple_lang.blockSignals(False)
         else:
-            _full = _entry[2] or "中文 (Chinese)"
-        lang_idx = self.lang_combo.findText(_full)
-        if lang_idx >= 0:
+            _code = _entry[1]
+        lang_idx = self.lang_combo.findData(_code)
+        if lang_idx >= 0 and self.lang_combo.model().item(lang_idx).isEnabled():
             self.lang_combo.setCurrentIndex(lang_idx)
 
         self.mode_combo.blockSignals(False)
@@ -2479,26 +2913,179 @@ class MainWindow(QMainWindow):
         eid = self.engine_combo.currentData()
         if not eid:
             return
-        self.cfg.setValue("lang_val", self.lang_combo.currentText())
+        # 存「不带后缀的规范显示名」：lang_val 与专业版共用同一个配置键，
+        # 存后缀会污染专业版那边的匹配（专业版按显示文本还原语言）。
+        self.cfg.setValue("lang_val", self._lang_canonical_text())
+
+    def _lang_canonical_text(self):
+        """当前选择对应的规范显示名（_LANG_ITEMS 里那个，不带「（需专业版）」后缀）。"""
+        code = self.lang_combo.currentData()
+        for label, c in self._LANG_ITEMS:
+            if c == code:
+                return label
+        return self.lang_combo.currentText()
+
+    def _ncnn_model_lang_tiers(self):
+        """当前模型所用字典的「语言代码 → 档位」表（ok / partial / unsupported）。"""
+        try:
+            model_base = self.model_combo.currentData() or ""
+            info = _PLUGIN_DIRS.get("ncnn_vulkan") or {}
+            pool = _load_ncnn_dict_pool(info.get("plugin_dir", ""),
+                                        _ncnn_keys_file_for_model(model_base))
+            return {code: _ncnn_lang_tier(code, pool) for _n, code in self._LANG_ITEMS}
+        except Exception:
+            return {}
+
+    def _lang_combo_codes(self):
+        """语言下拉的条目计划：[(显示文本, 代码, 档位)]。
+
+        档位：'ok' / 'partial' / 'unsupported_model'（不可选）/ 'unsupported_engine'（不可选）/ 'sep'。
+        支持的排前面，紧跟一条不可选的分隔行，需专业版的排在最后并加「（需专业版）」后缀。
+        ⚠ 不逐条罗列拉丁语系语言（原因见 _LANG_ITEMS 上方注释）。
+        ⚠ 档位随**当前模型**变 —— 模型决定用哪份字典，四份字典覆盖差别很大：
+           日文假名 v1 字典只有 4%、v6_tiny 字典是 0%（v5/v6 是 100%）；
+           希腊文 v1 字典只有 21%；越南文四份字典都只有 12~41%。
+        """
+        tiers = self._ncnn_model_lang_tiers()
+        items, need_pro = [], []
+        for label, code in self._LANG_ITEMS:
+            if code in self._LITE_UNSUPPORTED_CODES:
+                need_pro.append((label, code))
+                continue
+            t = tiers.get(code, "ok")
+            if t == "unsupported":
+                items.append((f"{label}{self._LITE_MODEL_UNSUPPORTED_SUFFIX}",
+                              code, "unsupported_model"))
+            elif t == "partial":
+                items.append((f"{label}{self._LITE_PARTIAL_SUFFIX}", code, "partial"))
+            else:
+                items.append((label, code, "ok"))
+        if need_pro:
+            items.append((self._SIMPLE_LANG_SEP, self._SIMPLE_LANG_SEP, "sep"))
+            items += [(f"{label}{self._LITE_UNSUPPORTED_SUFFIX}", code, "unsupported_engine")
+                      for label, code in need_pro]
+        return items
+
+    def _lang_index_for(self, want):
+        """按 lang_val 还原语言选择：新版存代码、旧版存显示文本，两种都认。"""
+        if not want:
+            return -1
+        i = self.lang_combo.findData(want)      # 新版：语言代码
+        if i >= 0:
+            return i
+        i = self.lang_combo.findText(want)      # 旧版：完整显示名
+        if i >= 0:
+            return i
+        for k in range(self.lang_combo.count()):    # 旧值可能是「名 + 后缀」
+            if self.lang_combo.itemText(k).startswith(str(want)):
+                return k
+        for label, code in self._LANG_ITEMS:    # 旧值可能被别的版本改过写法
+            if label == want:
+                i = self.lang_combo.findData(code)
+                if i >= 0:
+                    return i
+        return -1
+
+    def _lang_index_enabled(self, i):
+        try:
+            return bool(self.lang_combo.model().item(i).isEnabled())
+        except Exception:
+            return False
+
+    def _first_enabled_lang_index(self):
+        for i in range(self.lang_combo.count()):
+            if self._lang_index_enabled(i):
+                return i
+        return 0
 
     def _update_lang_combo(self):
         self.lang_combo.blockSignals(True)
         self.lang_combo.clear()
-        # 直接从 _LANG_ITEMS 填充；ncnn v6 通用字典不覆盖的文字灰显（需专业版）
-        for label, code in self._LANG_ITEMS:
-            self.lang_combo.addItem(label, code)
-        _m = self.lang_combo.model()
-        for _i, (_label, _code) in enumerate(self._LANG_ITEMS):
-            if _code in self._LITE_UNSUPPORTED_CODES:
-                _m.item(_i).setEnabled(False)
-                self.lang_combo.setItemData(_i, "轻量版引擎不支持该文字（识别会乱码），请使用专业版", Qt.ToolTipRole)
-        last_lang = self.cfg.value("lang_val", "中文 (Chinese)")
-        idx = self.lang_combo.findText(last_lang)
-        if idx >= 0 and self.lang_combo.model().item(idx).isEnabled():
-            self.lang_combo.setCurrentIndex(idx)
-        else:
-            self.lang_combo.setCurrentIndex(0)
+        brush_gray = QBrush(QColor("#8b949e"))
+        brush_amber = QBrush(QColor("#b8860b"))
+        gray_engine, gray_model, partial = [], [], []
+        raw_label = {c: l for l, c in self._LANG_ITEMS}   # 代码 → 不带后缀的原名
+        # 顶部说明行：把「语言在这里不参与识别」直接摆在列表最上面（不必悬停才看到）
+        self.lang_combo.addItem(
+            "ⓘ 语言只作声明、不参与识别 —— 字典跟着「模型」走，下列语言共用同一份字典", None)
+        _note = self.lang_combo.model().item(0)
+        if _note is not None:
+            _note.setEnabled(False)
+            _note.setForeground(brush_gray)
+        for text, code, state in self._lang_combo_codes():
+            if state == "sep":
+                self.lang_combo.addItem(text, code)
+                _i = self.lang_combo.count() - 1
+                self.lang_combo.model().item(_i).setEnabled(False)
+                self.lang_combo.setItemData(_i, "分隔行：以下文字轻量版不支持", Qt.ToolTipRole)
+                continue
+            # 显示文本（含「部分支持／此模型不支持／需专业版」后缀）由 _lang_combo_codes 产出
+            self.lang_combo.addItem(text, code)      # itemData 恒为语言代码，不带后缀
+            _i = self.lang_combo.count() - 1
+            item = self.lang_combo.model().item(_i)
+            if state == "unsupported_engine":
+                item.setEnabled(False)
+                item.setForeground(brush_gray)
+                self.lang_combo.setItemData(
+                    _i,
+                    "轻量版不支持该文字：四份 ncnn 字典实测 0 覆盖，识别必乱码。\n"
+                    "请使用专业版：NVIDIA 显卡自动切换到专用分语种模型；\n"
+                    "AMD / Intel / 纯 CPU 则使用 PP-OCRv5 (Paddle CPU) 备选引擎。",
+                    Qt.ToolTipRole)
+                gray_engine.append(raw_label.get(code, text))
+            elif state == "unsupported_model":
+                item.setEnabled(False)
+                item.setForeground(brush_gray)
+                self.lang_combo.setItemData(
+                    _i,
+                    "当前模型用的那份字典里没有这套文字（实测覆盖 < 60%），识别必乱码。\n"
+                    "换成 PP-OCRv6 模型（small / medium）即可支持；或改用专业版。",
+                    Qt.ToolTipRole)
+                gray_model.append(raw_label.get(code, text))
+            elif state == "partial":
+                item.setForeground(brush_amber)
+                self.lang_combo.setItemData(
+                    _i,
+                    "当前模型用的那份字典只覆盖该语言的基础字母，可能缺重音/变音符号。\n"
+                    "换成 PP-OCRv6 模型覆盖最全。",
+                    Qt.ToolTipRole)
+                partial.append(raw_label.get(code, text))
+        # tooltip = 基础说明 + 本次实测的「模型 → 字典 → 覆盖」
+        model_base = self.model_combo.currentData() or "(未选)"
+        keys_file = _ncnn_keys_file_for_model(model_base)
+        info = _PLUGIN_DIRS.get("ncnn_vulkan") or {}
+        pool = _load_ncnn_dict_pool(info.get("plugin_dir", ""), keys_file)
+        lines = [getattr(self, "_lang_tip_base", ""), "",
+                 f"当前模型：{model_base}",
+                 f"所用字典：{keys_file}（{len(pool)} 个字符）",
+                 "",
+                 "💡 该字典内 a-z / A-Z / 0-9 齐全 —— 中文模式下英文照样能识别，",
+                 "   中英混排文档不必切到英文；专门的拉丁/英文模型精度更高。"]
+        if gray_model:
+            lines += ["", "✕ 这份字典里没有（已置灰、不可选）：" + "、".join(gray_model)]
+        if partial:
+            lines += ["", f"⚠ 只覆盖基础字母、可能缺重音（{len(partial)} 项）："
+                      + "、".join(partial)]
+        if gray_engine:
+            lines += ["", f"（另有 {len(gray_engine)} 种文字系四份 ncnn 字典都不含："
+                      + "、".join(gray_engine) + "）"]
+        self.lang_combo.setToolTip("\n".join(lines))
+        idx = self._lang_index_for(self.cfg.value("lang_val", ""))
+        if idx < 0 or not self._lang_index_enabled(idx):
+            idx = self._first_enabled_lang_index()
+        self.lang_combo.setCurrentIndex(idx)
         self.lang_combo.blockSignals(False)
+
+    def _on_model_changed(self):
+        """切「模型」→ 所用字典变了 → 重建语言列表（并提示被排掉的文字系）。"""
+        prev = self._lang_canonical_text() if self.lang_combo.count() else ""
+        self._update_lang_combo()
+        now = self._lang_canonical_text() if self.lang_combo.count() else ""
+        if prev and now and prev != now:
+            try:
+                self.log(f"[语言] 新模型所用字典不含「{prev}」，已自动回落到「{now}」")
+            except Exception:
+                print(f"[语言] 新模型所用字典不含「{prev}」，已回落到「{now}」")
 
     def _populate_gpu_combo(self):
         """填充GPU设备下拉框"""
@@ -2607,11 +3194,140 @@ class MainWindow(QMainWindow):
         return False
 
     def clear_files(self):
+        if self._processing:
+            QMessageBox.information(
+                self, "处理中",
+                "本批任务正在跑，暂时不能清空待处理列表。\n请先「取消」或等它跑完。")
+            return
         self.file_list.clear()
         self._update_count()
 
     def _update_count(self):
+        # 处理中不覆盖状态栏的「处理中...（参数已锁定）」
+        if self._processing:
+            return
         self.status_label.setText(f"已选择 {self.file_list.count()} 个文件")
+
+    # ============================================================
+    # 待处理列表管理：删除选中 / 一键剔除已完成
+    # ============================================================
+    def _item_output_dir(self, path):
+        """某个待处理文件的输出目录。
+
+        与 start_processing 的约定保持一致：输出目录留空 = 输出到该文件自己的源目录。
+        """
+        out = self.output_edit.text().strip()
+        return out or os.path.dirname(path)
+
+    def _outputs_done(self, path):
+        """判断该文件是否「已处理完成、且已在目标目录导出」。
+
+        完成时 write_results 会在同一目录里同时写下
+        `{stem}_result.txt` 与 `{stem}_layered.pdf`。两个都在才算完成 ——
+        TXT 是最先写的，任务中途崩掉会只留 TXT，所以不能只看 TXT。
+        """
+        out_dir = self._item_output_dir(path)
+        stem = Path(path).stem
+        txt = os.path.join(out_dir, f"{stem}_result.txt")
+        pdf = os.path.join(out_dir, f"{stem}_layered.pdf")
+        return os.path.isfile(txt) and os.path.isfile(pdf)
+
+    def remove_selected_files(self):
+        """从待处理列表移除选中的文件（支持多选）。只动列表，不动磁盘文件。"""
+        if self._processing:
+            QMessageBox.information(
+                self, "处理中",
+                "本批任务正在跑，暂时不能修改待处理列表。\n请先「取消」或等它跑完。")
+            return
+        items = self.file_list.selectedItems()
+        if not items:
+            QMessageBox.information(
+                self, "未选中文件",
+                "请先在列表里点选要删除的文件：\n\n"
+                "· 按住 Ctrl 逐个多选\n"
+                "· 按住 Shift 选中连续一段\n"
+                "· 选中后直接按 Delete 键也可以\n\n"
+                "（只从列表移除，不会删除磁盘上的文件）")
+            return
+        paths = [it.data(Qt.UserRole) for it in items]
+        for it in items:
+            self.file_list.takeItem(self.file_list.row(it))
+        self._update_count()
+        self.log(f"已从待处理列表移除 {len(items)} 个文件")
+        for p in paths[:5]:
+            self.log(f"   - {os.path.basename(p)}")
+        if len(paths) > 5:
+            self.log(f"   ... 其余 {len(paths) - 5} 个略")
+
+    def prune_completed_files(self):
+        """一键剔除「已完成、且已在目标目录导出结果」的待处理文件。
+
+        判定：目标目录里同时存在 `{stem}_result.txt` 与 `{stem}_layered.pdf`。
+        典型用途：一批任务中途停止/出错后，只把还没导出的那些留下重跑。
+        ⚠ 只操作列表条目，绝不删除任何磁盘文件。
+        """
+        if self._processing:
+            QMessageBox.information(
+                self, "处理中",
+                "本批任务正在跑，暂时不能修改待处理列表。\n请先「取消」或等它跑完。")
+            return
+        total = self.file_list.count()
+        if total == 0:
+            QMessageBox.information(self, "列表为空", "待处理列表里还没有文件。")
+            return
+        done_items, done_paths = [], []
+        for i in range(total):
+            it = self.file_list.item(i)
+            p = it.data(Qt.UserRole)
+            try:
+                if self._outputs_done(p):
+                    done_items.append(it)
+                    done_paths.append(p)
+            except Exception:
+                continue  # 单个文件判定失败不影响其余
+        if not done_items:
+            out = self.output_edit.text().strip() or "（各文件自己的源目录）"
+            QMessageBox.information(
+                self, "没有已完成项",
+                f"列表里 {total} 个文件，都没有在目标目录找到\n"
+                f"「_result.txt + _layered.pdf」。\n\n当前输出目录：{out}")
+            return
+        out_desc = self.output_edit.text().strip() or "各文件自己的源目录"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("剔除已完成")
+        box.setText(f"检测到 {len(done_items)} 个文件已完成导出（列表共 {total} 个）。")
+        box.setInformativeText(
+            f"输出目录：{out_desc}\n\n"
+            f"将从列表移除这 {len(done_items)} 项，只留下还没导出的 "
+            f"{total - len(done_items)} 项。\n"
+            f"⚠ 只移除列表条目，不会删除任何文件。")
+        btn_ok = box.addButton("剔除", QMessageBox.AcceptRole)
+        box.addButton("算了", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_ok)
+        box.exec_()
+        if box.clickedButton() is not btn_ok:
+            return
+        for it in done_items:
+            self.file_list.takeItem(self.file_list.row(it))
+        self._update_count()
+        self.log(f"已剔除 {len(done_items)} 个已完成文件，"
+                 f"剩余 {self.file_list.count()} 个待处理")
+        for p in done_paths[:10]:
+            self.log(f"   ✔ {os.path.basename(p)}")
+        if len(done_paths) > 10:
+            self.log(f"   ... 其余 {len(done_paths) - 10} 个略")
+
+    def _mark_item_done(self, filename):
+        """把刚处理完的文件在列表里打上 ✔ 标记（按文件名匹配）。"""
+        for i in range(self.file_list.count()):
+            it = self.file_list.item(i)
+            base = os.path.basename(it.data(Qt.UserRole) or "")
+            if base == filename and not it.text().startswith("✔"):
+                it.setText(f"✔ {base}")
+                it.setForeground(QBrush(QColor("#1a7f37")))
+                return
+
     def browse_output(self):
         sd = self.output_edit.text().strip() or self._last_output_dir or os.path.expanduser("~")
         d = QFileDialog.getExistingDirectory(self, "选择输出目录", sd)
@@ -2646,8 +3362,22 @@ class MainWindow(QMainWindow):
             self.cfg.setValue("last_input_dir", self._last_input_dir)
 
     def _restore_engine_settings(self):
-        # 单一 ncnn_vulkan 引擎，无需 restore
-        pass
+        # 单一 ncnn_vulkan 引擎，无需 restore。
+        # 但要做「一次性迁移」：旧版本只在「开始处理」时落盘设置，用户改过「自动(推荐)」
+        # 后直接关窗就丢了，注册表里长期残留 mode_val='cpu' → 每次打开都回到 CPU 模式。
+        # 这里复位一次并打标记，之后完全按用户自己的选择记忆（v1.3.1 起 closeEvent 也落盘）。
+        if self.cfg.value("_mode_migrated_v131", "") != "yes":
+            self.cfg.setValue("mode_val", "auto")
+            self.cfg.setValue("_mode_migrated_v131", "yes")
+            try:
+                self._update_mode_combo()          # 立刻反映到界面上
+            except Exception:
+                pass
+            try:
+                self.log("[配置] 检测到旧版遗留的「CPU模式」设置，已复位为「自动(推荐)」"
+                         "（本次为一次性迁移，之后按你的选择记忆）")
+            except Exception:
+                print("[配置] mode_val 已一次性复位为 auto")
 
     def start_processing(self):
         if self.file_list.count() == 0:
@@ -2667,9 +3397,10 @@ class MainWindow(QMainWindow):
         vertical_text = self.vertical_check.isChecked()
         limit_side_len = self.side_len_spin.value()
         model_size = self.model_combo.currentData() or _get_first_valid_ncnn_model(engine_id) or "PP_OCRv6_medium"
-        lang_map = dict(self._LANG_ITEMS)
         lang_display = self.lang_combo.currentText() or "中文 (Chinese)"
-        ocr_lang = lang_map.get(lang_display, "chinese")
+        # 直接取 itemData：显示文本可能带「（需专业版）」后缀，靠文本反查会失配
+        ocr_lang = self.lang_combo.currentData() or "chinese"
+        self.log(f"  语言: {lang_display} ({ocr_lang})")
         use_angle_cls = self.angle_cls_check.isChecked()
         scale = self.scale_combo.currentIndex() + 1
         overwrite_ocr = self.overwrite_ocr_check.isChecked()
@@ -2733,6 +3464,7 @@ class MainWindow(QMainWindow):
             self.pause_btn.setEnabled(False)
             self.status_label.setText("正在取消...")
     def _on_progress(self, filename, ocr_completed, total):
+        self._current_file_name = filename
         self.current_file_label.setText(f"当前文件: {filename}")
         pct = int((ocr_completed / total) * 100) if total > 0 else 0
         self.page_info_label.setText(f"OCR完成 {ocr_completed} / {total} 页 ({pct}%)")
@@ -2742,19 +3474,26 @@ class MainWindow(QMainWindow):
             self.page_progress.setValue(int((ocr_completed / total) * 10000))
             ov = int(((self.processed_files + ocr_completed / total) / self.total_files) * 10000)
             self.overall_progress.setValue(int(ov))
+        self._mini_refresh()
     def _on_finished(self, filename, pdf_path, txt_path):
         self.processed_files += 1
         ov = int((self.processed_files / self.total_files) * 10000)
         self.overall_progress.setValue(ov)
         self.log(chr(10003) + f" 完成: {filename}")
+        # 在待处理列表里给这一项打 ✔，一眼能看出哪些已导出
+        self._mark_item_done(filename)
+        self._mini_refresh()
     def _on_error(self, filename, err):
         self.processed_files += 1
         ov = int((self.processed_files / self.total_files) * 10000)
         self.overall_progress.setValue(ov)
         self.log(chr(10007) + f" 错误 [{filename}]: {err}")
+        self._mini_refresh()
     def _on_cancelled(self, filename):
         self.log(f"已取消: {filename}")
     def _on_all_done(self, total, success, cancelled):
+        if self._mini_active:
+            self.exit_mini_mode()      # 处理完成 → 自动还原完整窗口
         self._safety_timer.stop()
         self._speed_timer.stop()
         self.log(f"\n处理完成! 成功: {success}/{total}")
@@ -2764,44 +3503,82 @@ class MainWindow(QMainWindow):
         self.speed_label.setText("处理速度: -- (已完成)")
         QMessageBox.information(self, "完成", f"批量处理完成!\n\n成功: {success}/{total} 个文件\n输出目录: {self.output_edit.text()}")
     def _set_buttons_processing(self):
+        # 处理中：锁死一切会改变「本批任务配置」的入口。
+        # 本批参数已在 start_processing 取走，中途改动会让界面显示与任务实际参数分叉。
+        self._processing = True
         self.start_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self.cancel_btn.setEnabled(True)
+        # 文件列表：只能看，不能增删（列表保持可见，方便用户盯着进度）
         self.add_files_btn.setEnabled(False)
         self.add_folder_btn.setEnabled(False)
+        self.add_folders_btn.setEnabled(False)
         self.clear_files_btn.setEnabled(False)
+        self.remove_sel_btn.setEnabled(False)
+        self.prune_done_btn.setEnabled(False)
+        # 识别参数
         self.engine_combo.setEnabled(False)
         self.mode_combo.setEnabled(False)
         self.model_combo.setEnabled(False)
+        self.lang_combo.setEnabled(False)
         self.gpu_combo.setEnabled(False)
         self.side_len_spin.setEnabled(False)
         self.scale_combo.setEnabled(False)
         self.vertical_check.setEnabled(False)
         self.angle_cls_check.setEnabled(False)
         self.overwrite_ocr_check.setEnabled(False)
+        self.rec_batch_spin.setEnabled(False)
+        self.shrink_check.setEnabled(False)
+        self.tensorrt_check.setEnabled(False)
         self.precision_combo.setEnabled(False)
         self.dual_check.setEnabled(False)
-        self.status_label.setText("处理中...")
+        # 输入模式 / 输出目录（输出目录是任务写入目标，中途改必然乱套）
+        self.mode_files.setEnabled(False)
+        self.mode_folder.setEnabled(False)
+        self.output_edit.setEnabled(False)
+        self.browse_output_btn.setEnabled(False)
+        # 界面模式切换（简单 ↔ 专业）与其面板 —— 本次修复的核心
+        self.ui_simple_btn.setEnabled(False)
+        self.ui_expert_btn.setEnabled(False)
+        self.simple_group.setEnabled(False)
+        self.status_label.setText("处理中...（参数已锁定）")
     def _set_buttons_idle(self):
         self._safety_timer.stop()
+        self._processing = False
+        self._mini_refresh()
         self.start_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("暂停")
         self.cancel_btn.setEnabled(False)
         self.add_files_btn.setEnabled(True)
         self.add_folder_btn.setEnabled(True)
+        self.add_folders_btn.setEnabled(True)
         self.clear_files_btn.setEnabled(True)
+        self.remove_sel_btn.setEnabled(True)
+        self.prune_done_btn.setEnabled(True)
         self.engine_combo.setEnabled(True)
         self.mode_combo.setEnabled(True)
         self.model_combo.setEnabled(True)
+        self.lang_combo.setEnabled(True)
         self.gpu_combo.setEnabled(True)
         self.side_len_spin.setEnabled(True)
         self.scale_combo.setEnabled(True)
         self.vertical_check.setEnabled(True)
         self.angle_cls_check.setEnabled(True)
         self.overwrite_ocr_check.setEnabled(True)
+        self.rec_batch_spin.setEnabled(True)
+        self.shrink_check.setEnabled(True)
+        self.tensorrt_check.setEnabled(True)
         self.precision_combo.setEnabled(True)
-        self.dual_check.setEnabled(True)
+        self.mode_files.setEnabled(True)
+        self.mode_folder.setEnabled(True)
+        self.output_edit.setEnabled(True)
+        self.browse_output_btn.setEnabled(True)
+        self.ui_simple_btn.setEnabled(True)
+        self.ui_expert_btn.setEnabled(True)
+        self.simple_group.setEnabled(True)
+        # 恢复引擎↔模式联动（例如 CPU 模式下双实例应保持禁用）
+        self._on_mode_changed()
         self.pause_label.setText("")
     def _safety_timeout(self):
         self._set_buttons_idle()
@@ -2836,9 +3613,236 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ════════════════════════════════════════════════════════════
+    # 系统托盘（只作入口）+ 迷你窗口（真正的「收小」方案）
+    # ------------------------------------------------------------
+    # 设计意图（2026-10-09 修订）：
+    #   * 最小化 = 普通最小化到任务栏。**不再收进托盘** —— Windows 11 会把新程序的
+    #     托盘图标默认折进「隐藏的图标」里，用户最小化后容易连窗口带图标一起找不到；
+    #   * 托盘图标只保留「显示主界面 / 显示运行日志窗口 / 退出程序」三个入口
+    #     （日志窗口的调出是跨进程的，用 Win32 FindWindow 按标题找）；
+    #   * 想「把两个窗口收小」请用迷你窗口模式：见 MiniWindow / enter_mini_mode。
+    # ════════════════════════════════════════════════════════════
+    APP_DISPLAY_NAME = "CathayOCR Lite"
+    LOG_WINDOW_TITLE = "CathayOCR Lite — 运行日志"   # 必须与启动器 APP_TITLE 一致
+
+    def _set_app_icon(self):
+        """窗口图标 —— 与启动器的日志窗口用同一个 ico，看起来就是同一个程序。"""
+        try:
+            ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CathayOCR.ico")
+            if os.path.isfile(ico):
+                self.setWindowIcon(QIcon(ico))
+        except Exception:
+            pass
+
+    def _setup_tray(self):
+        """建立系统托盘图标。只作「显示 / 退出」的便捷入口，不接管最小化。
+
+        托盘不可用时静默跳过，一切照旧。
+        """
+        try:
+            if not QSystemTrayIcon.isSystemTrayAvailable():
+                print("[Tray] 系统托盘不可用，跳过")
+                return False
+        except Exception:
+            return False
+        try:
+            icon = self.windowIcon()
+            if icon is None or icon.isNull():
+                ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CathayOCR.ico")
+                icon = QIcon(ico) if os.path.isfile(ico) else QIcon()
+            if icon.isNull():
+                icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
+            self._tray = QSystemTrayIcon(icon, self)
+            self._tray.setToolTip("%s —— 双击显示主界面" % self.APP_DISPLAY_NAME)
+
+            menu = QMenu(self)
+            act_show = QAction("显示主界面", self)
+            act_show.triggered.connect(self._restore_from_tray)
+            menu.addAction(act_show)
+            act_log = QAction("显示运行日志窗口", self)
+            act_log.triggered.connect(self._show_log_window)
+            menu.addAction(act_log)
+            menu.addSeparator()
+            act_quit = QAction("退出程序", self)
+            act_quit.triggered.connect(self._quit_from_tray)
+            menu.addAction(act_quit)
+
+            self._tray.setContextMenu(menu)
+            self._tray.activated.connect(self._on_tray_activated)
+            self._tray.show()
+            print("[Tray] 托盘图标已就绪（仅作显示/退出入口；最小化 = 进任务栏）")
+            return True
+        except Exception as e:
+            print("[Tray] 建立失败: %s" % e)
+            self._tray = None
+            return False
+
+    def _on_tray_activated(self, reason):
+        try:
+            if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
+                self._restore_from_tray()
+        except Exception:
+            pass
+
+    def _restore_from_tray(self):
+        """显示主界面（日志窗口由启动器自动一起还原）。"""
+        if self._mini_active:
+            self.exit_mini_mode()          # 迷你模式中点托盘 → 直接还原完整窗口
+            return
+        try:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+
+    def _show_log_window(self):
+        """把启动器的日志窗口调出来 —— 跨进程，用 Win32 按窗口标题查找。
+
+        （日志窗口是独立进程里的 tkinter 窗口，这里只做「显示 + 置顶」，不改它的状态。）
+        """
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            hwnd = u.FindWindowW(None, self.LOG_WINDOW_TITLE)
+            if not hwnd:
+                hwnd = u.FindWindowW("TkTopLevel", self.LOG_WINDOW_TITLE)
+            if not hwnd:
+                self.log("（日志窗口不在运行 —— 直接双击 CathayOCR Lite.exe 即可打开）")
+                return
+            u.ShowWindow(hwnd, 5)          # SW_SHOW
+            u.BringWindowToTop(hwnd)
+            u.SetForegroundWindow(hwnd)
+        except Exception as e:
+            print("[Tray] 调出日志窗口失败: %s" % e)
+
+    def _quit_from_tray(self):
+        self._quitting = True
+        self.close()                       # 走正常关闭流程（清理引擎 + 落盘设置）
+
+    # ════════════════════════════════════════════════════════════
+    # 迷你窗口模式（纯 UI：只读进度、只改窗口形态，不碰识别流程）
+    # ------------------------------------------------------------
+    #   * 进入：主窗口 hide() → 启动器的日志窗口检测到后自动一起收起；
+    #     同时把右下角的小进度卡 show 出来（它自己是独立顶层窗口，不受影响）。
+    #   * 退出：小卡片 hide()，主窗口按进入前的窗口状态还原 → 日志窗口自动回来。
+    #   * 处理结束（_on_all_done）会自动调 exit_mini_mode()。
+    # ════════════════════════════════════════════════════════════
+    def _mini_snapshot(self):
+        tot = int(getattr(self, "total_files", 0) or 0)
+        done = int(getattr(self, "processed_files", 0) or 0)
+        try:
+            pct = self.overall_progress.value() / 10000.0
+        except Exception:
+            pct = 0.0
+        return (self.APP_DISPLAY_NAME, self._current_file_name,
+                done, tot, pct, bool(self._processing))
+
+    def _mini_refresh(self):
+        """把当前进度推给迷你卡片（没开迷你模式时什么都不做）。"""
+        m = getattr(self, "_mini", None)
+        if m is None or not m.isVisible():
+            return
+        try:
+            m.set_state(*self._mini_snapshot())
+        except Exception:
+            pass
+
+    def _ensure_mini_window(self):
+        m = getattr(self, "_mini", None)
+        if m is None:
+            m = MiniWindow()
+            m.restore_requested.connect(self.exit_mini_mode)
+            m.on_top_changed.connect(self._save_mini_on_top)
+            try:
+                m.set_on_top(bool(self.cfg.value("mini_on_top", True, type=bool)),
+                             notify=False)
+            except Exception:
+                pass
+            self._mini = m
+        return m
+
+    def _save_mini_on_top(self, on):
+        """记住「迷你窗口是否置顶」，下次进迷你模式沿用。"""
+        try:
+            self.cfg.setValue("mini_on_top", bool(on))
+        except Exception:
+            pass
+        self.log("迷你窗口：%s" % ("已置顶" if on else "已取消置顶"))
+
+    def enter_mini_mode(self):
+        """把两个窗口收成一张右下角的小进度卡。"""
+        if self._mini_active:
+            return
+        try:
+            self._mini_prev_state = self.windowState()
+        except Exception:
+            self._mini_prev_state = Qt.WindowNoState
+        m = self._ensure_mini_window()
+        self._mini_active = True
+        try:
+            m.set_state(*self._mini_snapshot())
+            m.show_at_bottom_right()
+        except Exception as e:
+            print("[Mini] 显示迷你窗口失败: %s" % e)
+        try:
+            self.hide()          # 日志窗口由启动器检测到主窗口不可见后自动一起收起
+        except Exception:
+            pass
+        self.log("已切到迷你窗口模式 —— 处理结束后自动恢复；"
+                 "双击右下角小卡片或点它的「恢复」可随时回来。")
+
+    def exit_mini_mode(self):
+        """从迷你卡片回到完整窗口（日志窗口由启动器自动一起还原）。"""
+        if not self._mini_active:
+            return
+        self._mini_active = False
+        try:
+            if self._mini is not None:
+                self._mini.hide()
+        except Exception:
+            pass
+        try:
+            self.show()
+            if int(getattr(self, "_mini_prev_state", 0)) & int(Qt.WindowMaximized):
+                self.showMaximized()
+            else:
+                self.showNormal()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        self.log("已恢复完整窗口")
+
     def closeEvent(self, event):
         """窗口关闭时清理所有子进程"""
         print("[MainWindow] Cleaning up OCR instances...")
+
+        # 迷你卡片是独立顶层窗口，关程序时一起收掉，免得留个孤儿窗
+        try:
+            if self._mini is not None:
+                self._mini.hide()
+                self._mini.deleteLater()
+                self._mini = None
+        except Exception:
+            pass
+        # 先把托盘图标摘掉，否则关窗后托盘里会留一个点不动的"幽灵图标"
+        try:
+            if self._tray is not None:
+                self._tray.hide()
+                self._tray.setVisible(False)
+                self._tray = None
+        except Exception:
+            pass
+        # 【修复】关窗时先落盘设置。
+        # 旧实现只在「开始处理」时 _save_settings()，导致「改完设置直接关窗」的改动全部丢失
+        # —— 用户把模式改成「自动(推荐)」后关窗，下次打开仍是上次处理时存的 CPU 模式，
+        # 看起来就像「模式总是自己变成 CPU」。
+        try:
+            self._save_settings()
+        except Exception as e:
+            print(f"[MainWindow] save settings on close: {e}")
         try:
             # 【修复】只在引擎实例确实存在时才关闭。
             # 旧代码无条件 `OCRClient()`：实例不存在时会用默认参数真的启动
@@ -2979,5 +3983,6 @@ if __name__ == '__main__':
     app.setStyle('Fusion')
     window = MainWindow()
     window._restore_engine_settings()
+    window._setup_tray()          # 系统托盘：最小化时与日志窗口一起收起
     window.show()
     sys.exit(app.exec_())
