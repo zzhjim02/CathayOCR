@@ -1020,7 +1020,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         det_model, rec_model = model_map.get(selected, list(model_map.values())[0])
         lang = params.get("lang", "chinese")
         if lang != "chinese":
-            print(f"[Vulkan] Language: {lang} (PP-OCRv6 dict covers Latin/CJK/Korean/Cyrillic)")
+            print(f"[Vulkan] Language: {lang} (PP-OCRv6 dict 覆盖 中/英/日/拉丁/希腊，不含韩/西里尔/阿拉伯等)")
         # 【修复】字典必须跟随「实际选中的模型」selected，而不是传入的字符串。
         # 传入名不在可用列表里时 selected 会回退为 available[0]；若仍按原字符串
         # 选字典，就会出现「v5 字典 + v6 模型」→ 引擎 1~2 次请求后永久卡死。
@@ -1957,7 +1957,7 @@ class MainWindow(QMainWindow):
         # ── 土耳其文 ──
         ("Türkçe (土耳其文)", "tr"),
 
-        # ── 西里尔文系 (V6 通用字典) ──
+        # ── 西里尔文系 (需 PP-OCRv5 分语种模型: eslav/cyrillic；ncnn/V6 通用字典不含) ──
         ("Русский (俄文)", "ru"),
         ("українська (乌克兰文／西里尔字母)", "uk"),
         ("беларуская (白俄罗斯文／西里尔字母)", "be"),
@@ -2036,20 +2036,26 @@ class MainWindow(QMainWindow):
     _V5_FORCE_CODES = {"ar", "hi", "th", "te", "ta",
                        "korean", "ru", "multilang_v5"}
 
-    # ncnn 引擎（v6 通用字典 18709 字符）不覆盖的语言代码 —— 用于专业模式开跑前守卫
-    # （韩文/西里尔/阿拉伯/天城文/泰/泰卢固/泰米尔实测均为乱码或空输出）
+    # ncnn 引擎不支持的语言代码 —— **唯一事实来源**：
+    #   · 专业模式「语言下拉」按它过滤（不列出必乱码的语言）；
+    #   · 开跑前守卫 / 引擎切换提醒按它判定。
+    # 依据：实测 ncnn 的 v6 字典 models/ppocr_keys_v6.txt（18709 字）字符覆盖为
+    #   CJK 15565 · 假名 180 · ASCII 拉丁 52 · 希腊 76；
+    #   而 韩文(Hangul)=0 · 西里尔=0 · 阿拉伯=0 · 天城文=0 · 泰/泰卢固/泰米尔=0
+    #   （v5 字典同项亦分别仅 2 / 11 字，远不足以成词）→ 这些文字在 ncnn 上必乱码/空输出。
+    # 注意：希腊文(el) 与「多语言混排(中·英·日+拉丁)」「多语言混排(46 拉丁)」
+    #       均在 v6 字典覆盖范围内，**不**属于不支持集合。
     _NCNN_UNSUPPORTED = {
+        # 韩文
         "korean",
-        # 西里尔
+        # 西里尔文系
         "ru", "uk", "be", "bg", "mk", "mn", "kk", "ky", "tg", "tt", "ba", "cv", "rs_cyrillic",
         # 阿拉伯字母系
         "ar", "fa", "ug", "ur", "ps", "sd", "ks", "bal",
         # 天城文系
         "hi", "mr", "ne", "sa", "bh", "mai", "kok",
-        # 单文字系
+        # 东南亚单文字系
         "th", "te", "ta",
-        # 多语言(v6) 含韩俄成分
-        "multilang_v6",
     }
 
     def _simple_langs_checked(self):
@@ -2072,7 +2078,7 @@ class MainWindow(QMainWindow):
 
     @classmethod
     def _simple_pick_engine(cls, checked_codes, gpu_idx,
-                            available=("umi_plugin_v6", "ncnn_vulkan", "ncnn_cpu", "win7_v5")):
+                            available=("umi_plugin_v6", "ncnn_vulkan", "win7_v5")):
         """简单模式引擎决策（纯逻辑，便于单测）。
 
         gpu_idx 取值（与 simple_gpu 下拉一致）：
@@ -2090,8 +2096,10 @@ class MainWindow(QMainWindow):
            这些文字不在 v6/ncnn 通用字典（实测 0 字符覆盖），ncnn 引擎必乱码。
         2. 其余语言（普通路径）按显卡档位：
            NVIDIA≥12GB(0)                          → umi_plugin_v6 (CUDA，精度最高)
-           NVIDIA≤8GB(1) / AMD/Intel(2,3)          → ncnn_vulkan (Vulkan+双实例，省显存、更快)
-           核显/纯CPU(4)                            → ncnn_cpu
+           其余档位(1/2/3/4/5)                      → ncnn_vulkan
+             · 独显(1/2/3) 走 Vulkan/GPU；
+             · 核显·纯CPU(4) 由 _apply_simple_settings 把模式设为 CPU(use_gpu=False) ——
+               ncnn_cpu 与 ncnn_vulkan 是同一个二进制，故不再区分独立引擎。
            希腊文实测 ncnn 字典可识，归入普通路径。
            注：AMD/Intel 卡没有 CUDA，v6 引擎用不了 → 一律走 Vulkan。
         返回 (engine_id, downgraded)。downgraded=True 表示语言触发了专用引擎/模型切换。
@@ -2101,20 +2109,24 @@ class MainWindow(QMainWindow):
             # 专用分语种模型路径：只要 N 卡就走 v6 引擎（不限显存），否则走 v5 CPU 备选
             if nvidia and "umi_plugin_v6" in available:
                 return "umi_plugin_v6", True
-            for cand in ("win7_v5", "ncnn_vulkan", "ncnn_cpu"):
+            for cand in ("win7_v5", "ncnn_vulkan"):
                 if cand in available:
                     return cand, True
             return "umi_plugin_v6", True
-        # 普通路径：仅大显存 N 卡走 CUDA；小显存 N 卡与 A/I 卡走 Vulkan（省显存、可双实例）
+        # 普通路径：仅大显存 N 卡走 CUDA；其余走 ncnn Vulkan（核显/纯CPU 由模式=CPU 承担）
         if gpu_idx == 0 and "umi_plugin_v6" in available:
             return "umi_plugin_v6", False
-        if gpu_idx in (1, 2, 3) and "ncnn_vulkan" in available:
+        if "ncnn_vulkan" in available:
             return "ncnn_vulkan", False
-        return "ncnn_cpu", False
+        return "win7_v5", False
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CathayOCR Pro (专业版) - 多引擎PDF处理器")
+        # 界面就绪标志：__init__ 期间不弹「引擎/语言不匹配」提示
+        self._ui_ready = False
+        # 程序化切换引擎时抑制该提示（如简单模式同步）
+        self._engine_guard_suppress = False
         self.setGeometry(100, 100, 1100, 850)
         self.cfg = QSettings("QClaw", "PDFOCRProcessor")
         central = QWidget()
@@ -2268,8 +2280,13 @@ class MainWindow(QMainWindow):
         el = QHBoxLayout(eg)
         el.addWidget(QLabel("选择引擎:"))
         self.engine_combo = QComboBox()
+        # 隐藏引擎（不单独列出）：
+        #   ncnn_cpu 与 ncnn_vulkan 实为同一个二进制（两个 exe 的 MD5 完全相同），
+        #   CPU 运行统一由 ncnn Vulkan 的「CPU模式」(use_gpu=False) 承担，
+        #   故不再作为独立引擎出现在下拉里；旧配置若指向它会在下方回退到 Vulkan。
+        _HIDDEN_ENGINES = {"ncnn_cpu"}
         for eid, einfo in sorted(ENGINE_REGISTRY.items(), key=lambda x: x[1]["priority"], reverse=True):
-            if eid in _PLUGIN_DIRS:
+            if eid in _PLUGIN_DIRS and eid not in _HIDDEN_ENGINES:
                 label = einfo["name"]
                 if einfo["gpu"] and einfo["cpu"]:
                     label += " (GPU/CPU)"
@@ -2280,13 +2297,15 @@ class MainWindow(QMainWindow):
                 desc = einfo.get("desc", "")
                 if desc:
                     self.engine_combo.setItemData(idx, desc, Qt.ToolTipRole)
+        # 兼容旧配置：若存的是已合并的 ncnn_cpu，在 _restore_engine_settings 里映射到 ncnn Vulkan
         self.engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         self.engine_combo.setToolTip(
             "选择OCR引擎 (小白推荐: PP-OCRv6 ONNX CUDA):\n"
-            "  ⭐ PP-OCR (ncnn Vulkan) - 任意显卡均可用，速度最快\n"
+            "  ⭐ PP-OCR (ncnn Vulkan) - 任意显卡均可用，速度最快；\n"
+            "                            纯CPU机器请把右侧「模式」切到 CPU模式\n"
             "  PP-OCRv6 (ONNX CUDA)  - 精度最高，需NVIDIA独显\n"
-            "  PP-OCR (ncnn CPU)     - 纯CPU运行，兼容性最好\n"
-            "  PP-OCRv5/v3 (Paddle)  - 经典Paddle引擎\n"
+            "  PP-OCRv5 (Paddle CPU) - 备选，覆盖全部语种（含韩/俄/阿等）\n"
+            "  PP-OCRv3 (Paddle CPU) - 经典Paddle引擎，兼容性最好\n"
             "  EasyOCR               - 拉丁语系专用"
         )
         el.addWidget(self.engine_combo)
@@ -2577,6 +2596,7 @@ class MainWindow(QMainWindow):
         self.file_list.setAcceptDrops(True)
         self._update_model_combo()
         self._on_engine_changed()
+        self._ui_ready = True  # 界面已就绪，之后才允许弹出「引擎/语言不匹配」提示
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -2632,8 +2652,15 @@ class MainWindow(QMainWindow):
             if models:
                 for value, label in models:
                     self.model_combo.addItem(label, value)
+            elif eid == "win7_v5":
+                # PP-OCRv5 (Paddle CPU)：模型不在这里选，而是由「语言」决定 ——
+                # 服务端按语言路由到官方分语种模型（universal/latin/korean/eslav/cyrillic/
+                # arabic/devanagari/th/el/te/ta），故不再显示"中文"这种会误导的标签。
+                self.model_combo.addItem("按语言自动选择 (官方分语种模型)", "universal")
             else:
                 self.model_combo.addItem("中文 (默认)", "chinese")
+        # 单模型 / 语言驱动的引擎：模型下拉无意义，置灰
+        self.model_combo.setEnabled(eid not in ("win7_v5", "win7_classic"))
         last_model = self.cfg.value("model_val", "")
         idx = self.model_combo.findData(last_model)
         if idx >= 0:
@@ -2689,6 +2716,9 @@ class MainWindow(QMainWindow):
 
     def _on_engine_changed(self):
         eid = self.engine_combo.currentData()
+        # 记录切换前的语言：用于「新引擎不支持原语言」的提示
+        prev_lang = self.lang_combo.currentText()
+        prev_code = dict(self._LANG_ITEMS).get(prev_lang)
         self._update_model_combo()
         self._update_lang_combo()
         self._update_mode_combo()
@@ -2700,44 +2730,23 @@ class MainWindow(QMainWindow):
         self.gpu_combo.setVisible(is_vulkan)
         if is_vulkan:
             self._populate_gpu_combo()
-        # 引擎→模式自动同步：ncnn_cpu → CPU模式，ncnn_vulkan → 自动/GPU模式
-        mode = self.mode_combo.currentData()
-        if eid == "ncnn_cpu" and mode != "cpu":
-            midx = self.mode_combo.findData("cpu")
-            if midx >= 0:
-                self.mode_combo.blockSignals(True)
-                self.mode_combo.setCurrentIndex(midx)
-                self.mode_combo.blockSignals(False)
-        elif eid == "ncnn_vulkan" and mode == "cpu":
-            midx = self.mode_combo.findData("auto")
-            if midx < 0:
-                midx = self.mode_combo.findData("gpu")
-            if midx >= 0:
-                self.mode_combo.blockSignals(True)
-                self.mode_combo.setCurrentIndex(midx)
-                self.mode_combo.blockSignals(False)
+        # 注：ncnn 的 GPU/CPU 完全由「模式」下拉决定（CPU模式 = use_gpu=False，与 GPU 同一二进制），
+        #     已无独立的 ncnn_cpu 引擎，故此处不再做「引擎 ↔ 模式」的联动切换。
+        #     即：ncnn Vulkan + CPU模式 是一个合法且必要的状态（纯 CPU 机器就用它）。
+        # 新引擎不支持原语言 → 提示可一键跳转到推荐引擎
+        # （初始化 / 程序化切换 / 窗口尚未显示时不提示，避免干扰与无谓弹窗）
+        if (getattr(self, "_ui_ready", False)
+                and not getattr(self, "_engine_guard_suppress", False)
+                and self.isVisible()):
+            self._maybe_warn_lang_unsupported(eid, prev_lang, prev_code)
 
     def _on_mode_changed(self):
         """模式切换时处理逻辑"""
         mode = self.mode_combo.currentData()
-        eid = self.engine_combo.currentData()
-        
-        # ncnn_vulkan + CPU模式 → 自动切到 ncnn_cpu（Vulkan二进制在纯核显机器仍会用iGPU）
-        if mode == "cpu" and eid == "ncnn_vulkan":
-            cpu_idx = self.engine_combo.findData("ncnn_cpu")
-            if cpu_idx >= 0:
-                self.engine_combo.blockSignals(True)
-                self.engine_combo.setCurrentIndex(cpu_idx)
-                self.engine_combo.blockSignals(False)
-                self._on_engine_changed()
-        elif mode != "cpu" and eid == "ncnn_cpu":
-            vk_idx = self.engine_combo.findData("ncnn_vulkan")
-            if vk_idx >= 0:
-                self.engine_combo.blockSignals(True)
-                self.engine_combo.setCurrentIndex(vk_idx)
-                self.engine_combo.blockSignals(False)
-                self._on_engine_changed()
-        
+        # 注：ncnn 的 CPU 运行已统一由 ncnn Vulkan 的「CPU模式」(use_gpu=False) 承担，
+        #     与 Vulkan 是同一个二进制，故不再存在独立的 ncnn_cpu 引擎，
+        #     模式切换也不需要再联动切换引擎。
+
         # CPU模式下禁用双实例
         if mode == "cpu":
             self.dual_check.setChecked(False)
@@ -2830,9 +2839,12 @@ class MainWindow(QMainWindow):
         if eid in ("ncnn_cpu", "win7_v5", "win7_classic"):
             self.simple_gpu.setCurrentIndex(4)  # 核显/纯CPU
         elif eid == "ncnn_vulkan":
-            # 任意独显：是 NVIDIA 就按 NVIDIA 档；否则按 AMD/Intel
-            # （Vulkan 探测读不到显存 → 保守落在小显存档 3）
-            self.simple_gpu.setCurrentIndex(_nv if _nv is not None else 3)
+            if mode == "cpu":
+                self.simple_gpu.setCurrentIndex(4)  # ncnn Vulkan 的 CPU 模式 ≡ 纯 CPU
+            else:
+                # 任意独显：是 NVIDIA 就按 NVIDIA 档；否则按 AMD/Intel
+                # （Vulkan 探测读不到显存 → 保守落在小显存档 3）
+                self.simple_gpu.setCurrentIndex(_nv if _nv is not None else 3)
         else:
             # v6 (CUDA) 引擎：按实测显存落 NVIDIA 档（小显存在精度优先下套用 2240 防爆显存规则），
             # 探测不到 NVIDIA 才回退到大显存档
@@ -2942,7 +2954,12 @@ class MainWindow(QMainWindow):
 
         idx = self.engine_combo.findData(target_engine)
         if idx >= 0:
-            self.engine_combo.setCurrentIndex(idx)
+            # 程序化切换引擎：抑制「引擎不支持原语言」提示，避免简单模式同步时弹窗
+            self._engine_guard_suppress = True
+            try:
+                self.engine_combo.setCurrentIndex(idx)
+            finally:
+                self._engine_guard_suppress = False
             # _on_engine_changed 已触发，model/mode/lang 下拉已更新
 
         # ── 根据速度和文档类型计算参数 ──
@@ -2959,7 +2976,7 @@ class MainWindow(QMainWindow):
             target_precision = "fp32"
             target_shrink = True
 
-        # 识别批处理数：与精度档位无关，三档统一（固定 12）
+        # 识别批处理数：与精度档位无关，速度/标准/精度三档统一（_SIMPLE_REC_BATCH = 16）
         target_rec_batch = self._SIMPLE_REC_BATCH
 
         # 文档类型只决定「竖排 / 方向矫正」开关；边长与渲染倍率由「速度档 + 显存档」统一决定
@@ -3111,10 +3128,11 @@ class MainWindow(QMainWindow):
             self.lang_combo.addItems([item[0] for item in self._LANG_ITEMS])
             self.lang_combo.setEnabled(True)
         elif is_ncnn:
-            # ncnn: V6 语系（PP-OCRv6 内嵌字典覆盖拉丁/CJK/韩/西里尔），排除 V5-only 语系
-            _v5_only_codes = {"ar", "fa", "ug", "ur", "hi", "mr", "ne", "sa",
-                             "th", "el", "te", "ta", "multilang_v5"}
-            ncnn_items = [item[0] for item in self._LANG_ITEMS if item[1] not in _v5_only_codes]
+            # ncnn: 只列「v6 通用字典真正覆盖」的语言 —— 中/英/日/拉丁/希腊 + 多语言混排。
+            # 韩文/西里尔/阿拉伯/天城文/泰/泰卢固/泰米尔不在字典内（实测 0 字符覆盖），
+            # 一律不列出，避免用户选到必乱码的语言。（过滤器与开跑守卫共用同一集合）
+            ncnn_items = [item[0] for item in self._LANG_ITEMS
+                          if item[1] not in self._NCNN_UNSUPPORTED]
             self.lang_combo.addItems(ncnn_items)
             self.lang_combo.setEnabled(True)
         elif eid == "easyocr_universal":
@@ -3133,6 +3151,114 @@ class MainWindow(QMainWindow):
         if idx >= 0:
             self.lang_combo.setCurrentIndex(idx)
         self.lang_combo.blockSignals(False)
+
+    # ============================================================
+    # 引擎 ↔ 语言 兼容性
+    # ============================================================
+    def _engine_lang_supported(self, eid, code):
+        """判断某引擎是否支持某语言代码（据实测的字典/模型覆盖）。
+
+          · umi_plugin_v6 —— 全部语言（普通语言走 v6 通用字典；⚠语言自动回退 PP-OCRv5 分语种模型）
+          · win7_v5       —— 全部语言（语言 → 官方分语种模型路由）
+          · ncnn_vulkan / ncnn_cpu —— 仅 v6 通用字典覆盖的语言（中/英/日/拉丁/希腊/混排）
+          · easyocr_universal —— 仅 英/法/意/西
+          · 其余（如 win7_classic）—— 宽松放行，不拦截
+        """
+        if not code:
+            return True
+        if eid in ("ncnn_vulkan", "ncnn_cpu"):
+            return code not in self._NCNN_UNSUPPORTED
+        if eid == "easyocr_universal":
+            return code in ("en", "fr", "it", "es")
+        return True
+
+    def _recommend_engine_for_lang(self, code):
+        """给定语言代码，返回当前环境下「支持该语言」的推荐引擎 id（无则 None）。
+
+        规则与简单模式一致：NVIDIA 机器优先 PP-OCRv6（⚠语言在其内部自动回退 v5 分语种模型），
+        否则用 PP-OCRv5 (Paddle CPU) 备选。
+        """
+        avail = set(_PLUGIN_DIRS.keys())
+        nv = self._nvidia_tier()  # 0/1 = NVIDIA，None = 非 NVIDIA / 探测失败
+        if nv is not None and "umi_plugin_v6" in avail:
+            return "umi_plugin_v6"
+        if "win7_v5" in avail:
+            return "win7_v5"
+        if "umi_plugin_v6" in avail:
+            return "umi_plugin_v6"
+        return None
+
+    def _switch_engine_preserving_lang(self, rec, lang_display):
+        """切到推荐引擎，并尽量保持原语言仍被选中。返回新引擎 id（切换失败返回 None）。"""
+        if not rec:
+            return None
+        idx = self.engine_combo.findData(rec)
+        if idx < 0:
+            return None
+        self._engine_guard_suppress = True
+        try:
+            self.engine_combo.setCurrentIndex(idx)  # 触发 _on_engine_changed → 重建各下拉
+            li = self.lang_combo.findText(lang_display)
+            if li >= 0:
+                self.lang_combo.setCurrentIndex(li)
+        finally:
+            self._engine_guard_suppress = False
+        return rec
+
+    def _resolve_engine_lang_mismatch(self, engine_id, lang_display, ocr_lang):
+        """开跑前的「引擎-语言」守卫：当前引擎不支持所选语言时，
+
+        弹窗提示并可**一键跳转到推荐引擎**。
+        返回：最终应使用的 engine_id；用户选择「取消」时返回 None。
+        """
+        if self._engine_lang_supported(engine_id, ocr_lang):
+            return engine_id
+        cur_name = ENGINE_REGISTRY.get(engine_id, {}).get("name", engine_id)
+        rec = self._recommend_engine_for_lang(ocr_lang)
+        rec_name = ENGINE_REGISTRY.get(rec, {}).get("name", rec) if rec else "（无可用引擎）"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("引擎与语言不匹配")
+        box.setText(f"当前引擎「{cur_name}」不支持「{lang_display}」的文字。")
+        box.setInformativeText(
+            "用当前引擎识别会输出乱码或空结果。\n\n"
+            f"推荐改用：{rec_name}"
+        )
+        btn_switch = box.addButton(f"切换到 {rec_name}", QMessageBox.AcceptRole)
+        btn_keep = box.addButton("仍用当前引擎", QMessageBox.DestructiveRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_switch)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is btn_keep:
+            return engine_id
+        if clicked is btn_switch:
+            return self._switch_engine_preserving_lang(rec, lang_display)
+        return None  # 取消 / 关闭窗口
+
+    def _maybe_warn_lang_unsupported(self, eid, prev_lang, prev_code):
+        """用户切换引擎后，若新引擎不支持原语言 → 提示并可一键切回推荐引擎。"""
+        if not prev_code or self._engine_lang_supported(eid, prev_code):
+            return
+        rec = self._recommend_engine_for_lang(prev_code)
+        if not rec or rec == eid:
+            return
+        cur_name = ENGINE_REGISTRY.get(eid, {}).get("name", eid)
+        rec_name = ENGINE_REGISTRY.get(rec, {}).get("name", rec)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("引擎不支持该语言")
+        box.setText(f"「{cur_name}」不支持「{prev_lang}」的文字。")
+        box.setInformativeText(
+            f"是否切换到支持该语言的 {rec_name}？\n"
+            "（若选择「保留」，语言会退回该引擎支持的第一项。）"
+        )
+        btn_switch = box.addButton(f"切换到 {rec_name}", QMessageBox.AcceptRole)
+        box.addButton("保留当前引擎", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_switch)
+        box.exec_()
+        if box.clickedButton() is btn_switch:
+            self._switch_engine_preserving_lang(rec, prev_lang)
 
     def _populate_gpu_combo(self):
         """填充GPU设备下拉框"""
@@ -3301,11 +3427,19 @@ class MainWindow(QMainWindow):
 
     def _restore_engine_settings(self):
         last_engine = self.cfg.value("engine_id", "")
+        # 旧配置兼容：ncnn_cpu 已并入 ncnn Vulkan（同一二进制），映射后按其还原
+        if last_engine == "ncnn_cpu":
+            last_engine = "ncnn_vulkan"
         if last_engine and last_engine in _PLUGIN_DIRS:
             idx = self.engine_combo.findData(last_engine)
             if idx >= 0:
-                self.engine_combo.setCurrentIndex(idx)
-                self._on_engine_changed()
+                # 启动还原配置：抑制「引擎不支持原语言」提示（语言会自动回退到该引擎首项）
+                self._engine_guard_suppress = True
+                try:
+                    self.engine_combo.setCurrentIndex(idx)
+                    self._on_engine_changed()
+                finally:
+                    self._engine_guard_suppress = False
 
     def start_processing(self):
         if self.file_list.count() == 0:
@@ -3334,6 +3468,15 @@ class MainWindow(QMainWindow):
         lang_map["Espa\u00f1ol (EasyOCR)"] = "es"
         lang_display = self.lang_combo.currentText() or "中文 (Chinese)"
         ocr_lang = lang_map.get(lang_display, "chinese")
+        # ── 引擎-语言兼容性守卫：当前引擎不支持所选语言时，提示并可一键跳转到推荐引擎 ──
+        _resolved_eid = self._resolve_engine_lang_mismatch(engine_id, lang_display, ocr_lang)
+        if _resolved_eid is None:
+            return  # 用户选择取消
+        if _resolved_eid != engine_id:
+            engine_id = _resolved_eid
+            use_gpu = self.get_use_gpu()
+            lang_display = self.lang_combo.currentText() or lang_display
+            ocr_lang = lang_map.get(lang_display, ocr_lang)
         use_angle_cls = self.angle_cls_check.isChecked()
         scale = self.scale_combo.currentIndex() + 1
         extra_params = {}
@@ -3348,18 +3491,6 @@ class MainWindow(QMainWindow):
         extra_params["lang"] = ocr_lang
         if engine_id == "easyocr_universal":
             extra_params["easyocr_lang"] = lang_map.get(lang_display, "en")
-        # ── 引擎-语言兼容性守卫：ncnn 通用字典不含这些文字，识别必乱码 ──
-        if engine_id in ("ncnn_cpu", "ncnn_vulkan") and ocr_lang in self._NCNN_UNSUPPORTED:
-            _alt = "PP-OCRv6 (ONNX CUDA)" if use_gpu else "PP-OCRv5 (Paddle CPU)"
-            _resp = QMessageBox.question(
-                self, "引擎与语言不匹配",
-                f"「{lang_display}」的文字不在 ncnn 通用字典中（实测 0 字符覆盖），\n"
-                f"用当前引擎识别会输出乱码。\n\n"
-                f"建议改用：{_alt}（支持该语言），或 PP-OCRv5 (Paddle CPU)。\n\n"
-                f"仍要继续用当前引擎吗？",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if _resp != QMessageBox.Yes:
-                return
         dual_instance = self.dual_check.isChecked()
         self.total_files = len(file_list)
         self.processed_files = 0

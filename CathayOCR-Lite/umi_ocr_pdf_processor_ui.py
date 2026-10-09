@@ -1704,7 +1704,11 @@ class MainWindow(QMainWindow):
         ("泰米尔文", "ta", "தமிழ் (泰米尔文)"),
     ]
     _LITE_UNSUPPORTED_GROUPS = {"korean", "ru", "ar", "hi", "th", "te", "ta"}
-    # 专业模式语言代码级黑名单（ncnn v6 通用字典 0 覆盖）
+    # 专业模式语言下拉灰显黑名单。
+    # Lite 恒用 ncnn Vulkan；上面的 _LANG_ITEMS 是「精选 15 项」，其中不被
+    # ncnn 字典覆盖的只有 韩文 与 俄文（西里尔）—— 这两项灰显并提示「请使用专业版」。
+    # 依据实测 ncnn 的 v6 字典 models/ppocr_keys_v6.txt（18709 字）：
+    #   CJK 15565 · 假名 180 · 拉丁 52 · 希腊 76 ✅   韩文 0 · 西里尔 0 ❌
     _LITE_UNSUPPORTED_CODES = {
         "korean", "ru",
     }

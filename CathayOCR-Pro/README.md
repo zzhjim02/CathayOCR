@@ -140,15 +140,20 @@ OCR 返回 scale=2 渲染图像的像素坐标，写入 PDF 前未 ÷scale → �
 
 ## 核心特性
 
-### 引擎管理（6 引擎统一注册）
+### 引擎管理（5 引擎统一注册）
 
 通过 `ENGINE_REGISTRY` 统一管理，每个引擎声明入口文件、协议类型（管道 / TCP 持久连接 / 子进程）、GPU/CPU 支持、语言范围、可用参数。
 
 | 适配器模式               | 说明                     | 对应引擎                                         |
 | ------------------- | ---------------------- | -------------------------------------------- |
 | `PaddlePipeAdapter` | 管道 JSON 协议，子进程标准输入输出   | PP-OCRv6 ONNX CUDA、EasyOCR、PP-OCRv5、PP-OCRv3 |
-| `NcnnVulkanAdapter` | TCP 持久连接，Vulkan GPU 加速 | ncnn Vulkan                                  |
-| `NcnnCPUAdapter`    | 子进程单次调用，纯 CPU          | ncnn CPU                                     |
+| `NcnnVulkanAdapter` | TCP 持久连接，Vulkan GPU/CPU | ncnn（GPU 模式 `use_vulkan=true`；**CPU 模式 `use_vulkan=false`**） |
+
+> **「PP-OCR (ncnn CPU)」已合并进 ncnn Vulkan**：两个可执行文件
+> （`ppocr_ocr_cpu.exe` / `ppocr_ocr_vulkan.exe`）的 **MD5 完全相同**，是同一份二进制。
+> CPU 运行统一由 ncnn Vulkan 的「CPU模式」承担，引擎下拉里不再单独列出该项
+> （旧配置若指向 `ncnn_cpu`，启动时自动映射到 `ncnn_vulkan`）。
+> `NcnnCPUAdapter` 类保留在代码中作为历史实现，界面不再产生它的实例。
 
 ### 双模式界面
 
@@ -183,12 +188,13 @@ OCR 返回 scale=2 渲染图像的像素坐标，写入 PDF 前未 ÷scale → �
 
 | 引擎 ID               | 显示名称                   | 架构               |    GPU   | CPU | 语言范围                   | 通信协议    | 优先级 |
 | ------------------- | ---------------------- | ---------------- | :------: | :-: | ---------------------- | ------- | :-: |
-| `ncnn_vulkan`       | ⭐ PP-OCR (ncnn Vulkan) | ncnn + Vulkan    | ✅ 任意 GPU |  ✅  | v6 通用字典：拉丁 452 / 汉字 15565 / 假名 180 / 希腊 76 字（**不含韩文·西里尔·阿拉伯·天城文·泰系**） | TCP 持久  |  20 |
-| `umi_plugin_v6`     | PP-OCRv6 (ONNX CUDA)   | ONNX Runtime     | ✅ NVIDIA |  ✅  | **全部**：v6 通用字典 + 自动回退官方 v5 分语种模型（11 套） | 管道 JSON |  10 |
-| `easyocr_universal` | EasyOCR (拉丁语系)         | PyTorch          | ✅ 任意 GPU |  ✅  | 英/法/意/西 等拉丁字母（韩/俄已改用 PP-OCRv5 分语种模型，不再首选 EasyOCR） | 管道 JSON |  6  |
-| `win7_v5`           | PP-OCRv5 (Paddle CPU)  | Paddle Inference |     ❌    |  ✅  | **33 组映射**：阿拉伯字母系 / 天城文系 / 泰 / 希腊 / 泰卢固 / 泰米尔 / 韩文 / 东斯拉夫 / 西里尔 / 拉丁 40+ / 通用 | 管道 JSON |  9  |
-| `win7_classic`      | PP-OCRv3 (Paddle CPU)  | Paddle Inference |     ❌    |  ✅  | 中文（固定）                 | 管道 JSON |  3  |
-| `ncnn_cpu`          | PP-OCR (ncnn CPU)      | ncnn             |     ❌    |  ✅  | v6 通用字典（同 ncnn Vulkan；不含韩/西里尔/阿拉伯/天城/泰系） | 子进程单次   |  4  |
+| `ncnn_vulkan`       | ⭐ PP-OCR (ncnn Vulkan) | ncnn + Vulkan    | ✅ 任意 GPU |  ✅  | v6 通用字典：拉丁 452 / 汉字 15565 / 假名 180 / 希腊 76 字（**不含韩文·西里尔·阿拉伯·天城文·泰系**）——**语言下拉已按此过滤** | TCP 持久  |  20 |
+| `umi_plugin_v6`     | PP-OCRv6 (ONNX CUDA)   | ONNX Runtime     | ✅ NVIDIA |  ✅  | **全部 75 项**：v6 通用字典 + 自动回退官方 v5 分语种模型（11 套） | 管道 JSON |  10 |
+| `easyocr_universal` | EasyOCR (拉丁语系)         | PyTorch          | ✅ 任意 GPU |  ✅  | 英/法/意/西 4 项 | 管道 JSON |  6  |
+| `win7_v5`           | PP-OCRv5 (Paddle CPU)  | Paddle Inference |     ❌    |  ✅  | **全部 75 项**，**33 组映射**：阿拉伯字母系 / 天城文系 / 泰 / 希腊 / 泰卢固 / 泰米尔 / 韩文 / 东斯拉夫 / 西里尔 / 拉丁 40+ / 通用。模型下拉显示「按语言自动选择」(置灰) | 管道 JSON |  9  |
+| `win7_classic`      | PP-OCRv3 (Paddle CPU)  | Paddle Inference |     ❌    |  ✅  | 中文（固定，下拉置灰）                 | 管道 JSON |  3  |
+
+> `ncnn_cpu` 已合并进 `ncnn_vulkan`（同一二进制），**不再出现在引擎下拉中**。
 
 ### 各引擎一句话总结
 
@@ -223,7 +229,7 @@ OCR 返回 scale=2 渲染图像的像素坐标，写入 PDF 前未 ÷scale → �
 
 软件提供 **75 种语言/文字选项**。关键分界：**"通用字典能认的文字"** 与 **"必须换分语种模型（⚠）的文字"** —— 后者正是简单模式勾选框里带 ⚠ 的那几组。
 
-### ① v6 通用字典（ncnn Vulkan / ncnn CPU / PP-OCRv6 CUDA 均支持）
+### ① v6 通用字典（ncnn Vulkan / PP-OCRv6 CUDA 均支持）
 
 实测字典 `ppocr_keys_v6.txt` = **18709 条**：汉字 15565 + 拉丁 452 + 假名 180 + 希腊 76 + 其他符号。
 **该字典不含韩文、西里尔、阿拉伯、天城文、泰系字符（实测均 0 字符覆盖）。**
@@ -251,7 +257,12 @@ OCR 返回 scale=2 渲染图像的像素坐标，写入 PDF 前未 ÷scale → �
 | **天城文系** | हिन्दी、मराठी、नेपाली、संस्कृत、भोजपुरी、मैथिली、कोंकणी | ❌ 乱码 | 自动回退 v5 devanagari 模型 | v5 devanagari |
 | **泰 / 泰卢固 / 泰米尔** | ภาษาไทย、తెలుగు、தமிழ் | ❌ 乱码 | 自动回退 v5 th / te / ta 模型 | v5 th / te / ta |
 
-> ⚠ 上述文字在 ncnn 引擎下**必乱码**。简单模式勾选对应 ⚠ 组会自动切换到能认它的引擎并在配置摘要中明示；专业模式手动把 ncnn 引擎与这些语言配在一起时，点「开始处理」会**弹窗拦截提醒**。
+> ⚠ 上述文字在 ncnn 引擎下**必乱码**。
+> - **简单模式**：勾选对应 ⚠ 组会自动切换到能认它的引擎，并在配置摘要中明示。
+> - **专业模式**：选 ncnn Vulkan 时，语言下拉**根本不会列出**这些文字（按字典覆盖过滤，共隐藏 32 项）；
+>   若你从别的引擎切过来、当前语言恰好不被新引擎支持，会**弹窗提示并可一键跳转到推荐引擎**
+>   （推荐：NVIDIA 机器 → PP-OCRv6 ONNX CUDA；否则 → PP-OCRv5 Paddle CPU）；
+>   点「开始处理」时也有同样的守卫，按钮为「切换到推荐引擎 / 仍用当前引擎 / 取消」。
 
 ### ③ EasyOCR（拉丁语系备选，非首选）
 
@@ -265,16 +276,19 @@ OCR 返回 scale=2 渲染图像的像素坐标，写入 PDF 前未 ÷scale → �
 
 ## 引擎对比与选型指南
 
-| 评价维度       | ncnn Vulkan ⭐ | PP-OCRv6 ONNX CUDA |  ncnn CPU |
+| 评价维度       | ncnn Vulkan ⭐ | PP-OCRv6 ONNX CUDA |  ncnn Vulkan·CPU模式 |
 | ---------- | :-----------: | :----------------: | :-------: |
 | **速度**     |    ⭐⭐⭐⭐⭐ 最快   |       ⭐⭐⭐⭐ 快       |    ⭐⭐ 慢   |
 | **识别精度**   |   ⭐⭐⭐⭐⭐（同模型）  |        ⭐⭐⭐⭐⭐       |    ⭐⭐⭐⭐   |
 | **显卡兼容**   |     任意 GPU    |      仅 NVIDIA      |    不要显卡   |
-| **CPU 回退** |      ✅ 原生     |        ✅ 支持        |    ✅ 原生   |
+| **CPU 回退** |      ✅ 原生     |        ✅ 支持        |    ✅ 同一引擎   |
 | **双实例效果**  |    优秀（显存低）    |       好（显存高）       |     一般    |
 | **双实例速度**  |    ~2.2 页/秒   |      ~1.1 页/秒      |  ~0.4 页/秒 |
 | **模型兼容**   |   v3~v6 全系列   |        固定 v6       | v3~v6 全系列 |
-| **语言覆盖**   |   v6 通用字典（拉丁/CJK/希腊）  |    **全部**（通用字典 + ⚠ 回退 v5 分语种模型）   | v6 通用字典（同 Vulkan） |
+| **语言覆盖**   |   v6 通用字典（拉丁/CJK/希腊）  |    **全部 75 项**（通用字典 + ⚠ 回退 v5 分语种模型）   | v6 通用字典（同上） |
+
+> ℹ 第三列的「CPU 模式」不是独立引擎：把 **ncnn Vulkan 的「模式」下拉切到「CPU模式」** 即可（`use_vulkan=false`），
+> 与原 `ncnn_cpu` 是**同一份可执行文件**（MD5 相同）。
 
 > ⚠ **重要说明**：ncnn Vulkan 和 PP-OCRv6 ONNX CUDA 的普通语言都用 PP-OCRv6 模型，**识别精度由所选模型版本决定，不取决于引擎**。同模型下 ncnn Vulkan 识别率略高。
 > ⚠ **韩文/西里尔/阿拉伯/天城文/泰系在 ncnn 下必乱码**（字典 0 覆盖）：必须用 PP-OCRv6 CUDA（自动回退 v5 分语种模型）或 PP-OCRv5 (Paddle CPU)。
@@ -286,7 +300,7 @@ OCR 返回 scale=2 渲染图像的像素坐标，写入 PDF 前未 ÷scale → �
 | **有 NVIDIA 显卡，普通文档（中/英/法/德/日）** | ⭐ **ncnn Vulkan**        | 速度最快、省显存；大显存（≥12GB）可改选 PP-OCRv6 CUDA 换精度 |
 | **有 NVIDIA 显卡，含韩/俄/阿拉伯/印地/泰文**   | **PP-OCRv6 ONNX CUDA**   | 引擎自动回退 v5 分语种模型，是唯一能认这些文字的 GPU 机器方案 |
 | **AMD / Intel 独显**                | **ncnn Vulkan**          | 唯一 GPU 选项；含 ⚠ 文字时改选 PP-OCRv5 (Paddle CPU)。分大小显存两档（只影响精度优先时的边长） |
-| **无独显 / 纯核显**                     | **ncnn CPU**             | 稳定兼容；含 ⚠ 文字时改选 PP-OCRv5 (Paddle CPU) |
+| **无独显 / 纯核显**                     | **ncnn Vulkan**（模式切 **CPU**） | 稳定兼容；含 ⚠ 文字时改选 PP-OCRv5 (Paddle CPU) |
 | **不确定显卡型号 / 显存多大**                  | ⭐ 选「🤖 不知道有没有独显 / 显存多大 → 自动检测」 | 自动检测后落到上面某一档 |
 | **不确定配置，就想快点上手**                  | ⭐ 勾「🎯 简单模式」 | 回答 3 个问题 + 勾语言，全自动 |
 
@@ -363,7 +377,7 @@ OCR 返回 scale=2 渲染图像的像素坐标，写入 PDF 前未 ÷scale → �
 | -------------------------------- | :-: | :----: | :----------: | :-----: |
 | ncnn Vulkan 双实例 FP16 v6 Medium   | 157 |  ~70 s | **~2.2 p/s** |   ~85%  |
 | PP-OCRv6 ONNX CUDA 单实例 v6 Medium | 160 | ~145 s |   ~1.1 p/s   |   ~60%  |
-| ncnn CPU 单实例 FP32 v6 Medium      | 100 | ~300 s |   ~0.3 p/s   |   N/A   |
+| ncnn Vulkan·CPU模式 单实例 FP32 v6 Medium | 100 | ~300 s |   ~0.3 p/s   |   N/A   |
 
 > **字符覆盖率**：ncnn Vulkan 比 ONNX CUDA 略高（101.4% vs 100%），属于检测框分割策略差异。CUDA 版对表格和校勘条目（「○」「□」）识别更稳定。
 
@@ -438,7 +452,7 @@ A: 这是正常提示（没有 NVIDIA 显卡或没有驱动时才出现）。选
 
 ### Q: 进度不动了 / 卡住了？
 
-A: 点击「停止」，关掉程序重新打开。如果频繁卡住：① 检查任务管理器里有没有残留的 OCR 进程；② 调低批处理数；③ 选 ncnn CPU 引擎试试。
+A: 点击「停止」，关掉程序重新打开。如果频繁卡住：① 检查任务管理器里有没有残留的 OCR 进程；② 调低批处理数；③ 选 ncnn Vulkan 并把「模式」切到 **CPU模式** 试试。
 
 ### Q: 识别结果全是乱码？
 
@@ -450,7 +464,7 @@ A: ① 确认模式是"自动"或"GPU模式"；② 打开「双实例并行」�
 
 ### Q: 识别质量不好？
 
-A: ① 渲染倍率调到 3x；② 图像边长调到 3000；③ 选 ncnn CPU 引擎（稳定）；④ 如果用 ONNX CUDA，试一下模型从 small 换 medium。
+A: ① 渲染倍率调到 3x；② 图像边长调到 3000；③ 选 ncnn Vulkan 并把「模式」切到 **CPU模式**（稳定）；④ 如果用 ONNX CUDA，试一下模型从 small 换 medium。
 
 ### Q: GPU 利用率很低（<50%）？
 
@@ -473,8 +487,8 @@ A: 可以安全删除的是：
 | NVIDIA GTX 系列       |      ✅      |          ✅         | 同上                                      |
 | AMD Radeon RX 5000+ |      ✅      |          ❌         | ncnn Vulkan（含 ⚠ 语种改 PP-OCRv5 Paddle CPU）；精度优先边长 ≥12GB 2560 / ≤8GB 2240 |
 | Intel Arc A 系列      |      ✅      |          ❌         | ncnn Vulkan（含 ⚠ 语种改 PP-OCRv5 Paddle CPU）；精度优先边长 ≥12GB 2560 / ≤8GB 2240 |
-| AMD Vega / 核显       |      ❌      |          ❌         | ncnn CPU                                |
-| Intel UHD / Iris Xe |      ❌      |          ❌         | ncnn CPU（含 ⚠ 语种改 PP-OCRv5 Paddle CPU）  |
+| AMD Vega / 核显       |      ❌      |          ❌         | ncnn Vulkan（模式切 **CPU**）               |
+| Intel UHD / Iris Xe |      ❌      |          ❌         | ncnn Vulkan（模式切 **CPU**；含 ⚠ 语种改 PP-OCRv5 Paddle CPU） |
 
 ---
 
