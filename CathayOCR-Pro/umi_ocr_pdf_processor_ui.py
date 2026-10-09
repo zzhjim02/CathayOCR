@@ -581,6 +581,35 @@ def get_model_display_name(model_key):
 
 _GPU_DEVICES = None
 
+# ── OCR 结果码（2026-10-10 整理，两版一致）──────────────────────────────
+#   100 引擎给出文字块（有结论）
+#   101 引擎明确回复「本页无文字」（有结论，空白页——不算失败）
+#   102 引擎层错误：真超时（卡满 timeout_sec）/ TCP 断开 / JSON 解析失败
+#   103 引擎不可用：进程没了或端口不通，_ensure_running() 判定失败（约 1 秒返回）
+#   900 调用侧异常（base64/PNG 解码、包装函数抛错）——与引擎无关
+#
+# 为什么要把 103 从 102 里拆出来（2026-10-10 修复·之一）：
+#   旧版把「引擎不可用」硬写成 code=102 + data 含 "timeout"，只为蹭看门狗那条
+#   「102 且 data 含 timeout」的判定。副作用是日志里出现自相矛盾的
+#   「超时 1s (limit=180s)」——那 1 秒其实是 _server_running() 的探测超时，
+#   跟 OCR 的 180 秒限时毫无关系，用户看到只会以为真超时了。
+_RESULT_ENGINE_UNAVAILABLE = 103
+# 引擎层故障（该重启引擎才对）：102 超时/引擎错 + 103 不可用。
+# 600/900 之类调用侧异常**不在此列** —— 跟引擎无关，重启只会白等几秒。
+_RESULT_ENGINE_ERROR_CODES = (102, _RESULT_ENGINE_UNAVAILABLE)
+
+# 【2026-10-10 修复·之十】连接层瞬时抖动的「透明重发」次数。
+# 线上现象（两份 715 页日志）：请求已发出、引擎一个字节都没回（已收=0B），
+# 连接就在 0.6~0.7 秒被中止（WinError 10053 本机侧 / 10054 引擎侧），
+# 而引擎进程全程健康 —— engine start 头未增加、exited=0、stderr 无任何报错。
+# 语义上「响应 0 字节」= 引擎没有产出任何结果 = 这一页从未被处理过，
+# 因此原样重发这一页是**幂等安全**的，不会产生重复识别等副作用。
+# 在此处透明重发的好处：
+#   · 不消耗页级重试预算（MAX_PAGE_RETRY 仍是 1，不擅改用户定稿的策略）
+#   · 不重启任何引擎（不会牵连另一个本来健康的实例）
+#   · 用户不必再看到「引擎层故障」——那其实只是连接抖了一下
+_TCP_TX_RETRY = 2
+
 def _detect_vulkan_gpus(force_redetect=False):
     """
     运行ncnn Vulkan exe检测可用的GPU设备。
@@ -1096,6 +1125,14 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         self.current_config = {}
         self._started = False
         self._ocr_times = collections.deque(maxlen=20)  # 最近OCR耗时(秒)，用于自适应超时
+        # 【2026-10-10 修复·之六】临时 PNG 文件改为「每个线程一份」，绝不再跨线程共用。
+        # 旧实现所有线程共用同一个复用文件：两个 consumer 并发落到同一个 adapter 时，
+        # A 的请求正被引擎读取、B 把同一个文件截断重写 → 引擎读到损坏的 PNG →
+        # 原生崩溃（本机 WER 已禁用，崩溃在系统里不留任何痕迹）→ 连接被 RST →
+        # 日志里成对出现的 TCP error 10053 / 10054。
+        self._tls = threading.local()
+        self._tmp_paths = []
+        self._tmp_paths_lock = threading.Lock()
 
     def set_port_offset(self, offset):
         """设置端口偏移，支持多实例并行"""
@@ -1104,6 +1141,73 @@ class NcnnVulkanAdapter(OCREngineAdapter):
     @property
     def _server_port(self):
         return self.port + self.port_offset
+
+    def _open_stderr_log(self):
+        """把引擎的 stderr 落到「引擎目录/engine_<端口>_stderr.log」（2026-10-10 修复·之五）。
+
+        原版用的是 stderr=subprocess.PIPE，但**全程没有任何地方读这个管道**，两个后果：
+          ① 引擎往 stderr 写得多了会把管道缓冲区（约 4KB）写满 → 引擎自己阻塞在 write
+             上，看起来就是「引擎活着但一直不回复」，极难排查；
+          ② 引擎临终前打印的报错被永久留在管道里 —— 它为什么死，程序自己丢掉了。
+             2026-10-10 那份 715 页日志的死因因此查不出来。
+        改成落盘后既不会阻塞，事后也能直接翻文件。父进程关闭自己的句柄不影响
+        子进程（子进程持有的是继承过去的那份），所以可以先关再读。
+        """
+        self._close_stderr_log()
+        try:
+            path = os.path.join(self.plugin_dir,
+                                "engine_%d_stderr.log" % self._server_port)
+            # 【2026-10-10 修复·之七】改成**追加**：原来每次重启都用 "wb" 截断，
+            # 等于把上一次崩溃前引擎留下的最后几行直接抹掉。本机 WER 已禁用，
+            # 这个文件是唯一的死因线索。超过 512KB 轮转一次，避免无限增长。
+            try:
+                if os.path.exists(path) and os.path.getsize(path) > 512 * 1024:
+                    os.replace(path, path + ".1")
+            except Exception:
+                pass
+            self._stderr_path = path
+            self._stderr_fh = open(path, "ab", buffering=0)
+        except Exception:
+            self._stderr_fh = None
+            self._stderr_path = None
+
+    def _close_stderr_log(self):
+        """关掉 stderr 日志句柄（幂等；不影响正在写该文件的子进程）。"""
+        fh = getattr(self, "_stderr_fh", None)
+        self._stderr_fh = None
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+    def _note_stderr(self, text):
+        """往引擎日志里插一行「本程序视角」的记录（2026-10-10 修复·之七）。
+
+        引擎若是原生崩溃，它自己不会留下任何遗言（本机 WER 已禁用，
+        系统事件日志 / WER 归档里一条都查不到）。所以退出码、重启原因这些
+        关键事实必须由我们写进同一个文件，否则事后无从判断「是崩了还是被杀」。
+        """
+        fh = getattr(self, "_stderr_fh", None)
+        if fh is None:
+            return
+        try:
+            fh.write(("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
+                     ).encode("utf-8", errors="replace"))
+        except Exception:
+            pass
+
+    def _read_stderr_tail(self, limit=600):
+        """读引擎 stderr 日志的尾部（启动失败时把原因带回主日志）。"""
+        path = getattr(self, "_stderr_path", None)
+        if not path:
+            return ""
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            return data[-limit:].decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return ""
 
     def start(self, params):
         self.stop()
@@ -1131,13 +1235,22 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                 # 不传 --vulkan 命令行参数，完全依赖 config.json 的 use_vulkan + gpu_device_index
                 print(f"[Vulkan] GPU模式 config: gpu_device_index={params.get('gpu_device', -1)}")
             print(f"[Vulkan] Starting: {' '.join(cmd)}")
+            self._open_stderr_log()
             self.server_proc = subprocess.Popen(
                 cmd,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE, cwd=self.plugin_dir,
+                stdin=subprocess.DEVNULL,
+                # 【2026-10-10 修复·之七】stdout 也一起落盘（原来 DEVNULL 丢掉了）。
+                # 两个流写同一个**文件**（不是管道），不会阻塞。
+                stdout=(self._stderr_fh if self._stderr_fh is not None
+                        else subprocess.DEVNULL),
+                stderr=(self._stderr_fh if self._stderr_fh is not None
+                        else subprocess.DEVNULL),
+                cwd=self.plugin_dir,
                 startupinfo=startupinfo,
                 creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
             )
+            self._note_stderr("=== engine start pid=%s port=%s cmd=%s ==="
+                              % (self.server_proc.pid, port, " ".join(cmd)))
             deadline = time.time() + 30
             while time.time() < deadline:
                 if self._server_running():
@@ -1145,17 +1258,16 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                     print("[Vulkan] Server is ready on port " + str(port))
                     return ""
                 if self.server_proc.poll() is not None:
-                    stderr_text = ""
-                    try:
-                        stderr_text = self.server_proc.stderr.read().decode('utf-8', errors='ignore')[:500]
-                    except: pass
+                    _rc = self.server_proc.returncode
+                    self._note_stderr("engine exited during startup: returncode=%s" % _rc)
+                    self._close_stderr_log()
+                    stderr_text = self._read_stderr_tail()
                     self.server_proc = None
-                    return "[Error] Vulkan server exited during startup. stderr: " + stderr_text
+                    return ("[Error] Vulkan server exited during startup (returncode=%s)."
+                            " stderr: %s" % (_rc, stderr_text))
                 time.sleep(0.1)
-            stderr_text = ""
-            try:
-                stderr_text = self.server_proc.stderr.read().decode('utf-8', errors='ignore')[:500]
-            except: pass
+            self._close_stderr_log()
+            stderr_text = self._read_stderr_tail()
             return "[Error] Vulkan server failed to start within 30s. stderr: " + stderr_text
         except Exception as e:
             return f"[Error] Vulkan start failed: {str(e)}"
@@ -1244,29 +1356,67 @@ class NcnnVulkanAdapter(OCREngineAdapter):
     def _tcp_request(self, request, timeout=180):
         with self.lock:
             if not self._ensure_running():
-                # 【2026-10-09 修复】必须带 "timeout" 关键字：看门狗只把
-                # 「code=102 且 data 含 timeout」判定为引擎故障并触发 Tier1=restart_all()
-                # （两个实例一起重启）。若沿用旧的 "server not available"，看门狗不重启，
-                # 这一页会被当成普通错误直接记进结果里。
-                return {"code": 102, "data": "OCR timeout (engine unavailable)"}
-            try:
-                with socket.create_connection(("127.0.0.1", self._server_port), timeout=timeout) as sock:
-                    sock.settimeout(timeout)
-                    json_str = json.dumps(request)
-                    sock.sendall(json_str.encode("utf-8"))
-                    chunks = []
-                    while True:
-                        try:
-                            chunk = sock.recv(4096)
-                        except socket.timeout:
-                            return {"code": 102, "data": f"OCR timeout ({timeout}s)"}
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                    text = b"".join(chunks).decode("utf-8", errors="ignore")
-                    return self._parse_json(text)
-            except Exception as e:
-                return {"code": 102, "data": f"TCP error: {str(e)}"}
+                # 【2026-10-10 修复·之一】原版这里返回的是
+                #     {"code": 102, "data": "OCR timeout (engine unavailable)"}
+                # —— 塞进 "timeout" 关键字纯粹是为了蹭看门狗那条
+                # 「code=102 且 data 含 timeout」的判定，好让它触发 Tier1。
+                # 代价是「引擎不可用」和「真·180 秒超时」从此不可区分：
+                # 日志上打出「超时 1s (limit=180s)」，用户根本没法判断到底发生了什么。
+                # 现在改用独立结果码 103，语义明确，也不再需要蹭关键字。
+                return {"code": _RESULT_ENGINE_UNAVAILABLE,
+                        "data": "OCR engine unavailable (port %d not answering)"
+                                % self._server_port}
+            # 【2026-10-10 修复·之九】把 TCP 错误细分到「发生阶段」并记录耗时与异常类型。
+            # 原来 connect / send / recv 三段共用一个 except，日志只剩
+            #     "TCP error: [WinError 10053] ..."
+            # —— 看不出断在哪一步、断了多久、什么异常，用户为此连着追问
+            #    「引擎层故障到底是怎么回事」。补齐这三项后，下次再出现即可直接定性：
+            #     阶段=connect  → 引擎监听 / accept 出问题（引擎侧）
+            #     阶段=send     → 连接刚建成即被中止（本机栈 / 安全软件）
+            #     阶段=recv，耗时很短   → 引擎处理中主动关掉了连接
+            #     阶段=recv，耗时≈timeout → 超时边界
+            # 注意辨别：WinError 10053「你的主机中的软件中止了一个已建立的连接」
+            #   是**本机**一侧被中止（WSAECONNABORTED）；对端强行关闭是 10054
+            #   「远程主机强迫关闭了一个现有的连接」（WSAECONNRESET）。两者别混。
+            _err = "no response"
+            # 【2026-10-10 修复·之十】透明重发循环 —— 判据与理由见 _TCP_TX_RETRY 的注释。
+            for _tx in range(_TCP_TX_RETRY + 1):
+                _t_stage = "connect"
+                _t_beg = time.time()
+                _t_recv = 0
+                try:
+                    with socket.create_connection(("127.0.0.1", self._server_port), timeout=timeout) as sock:
+                        sock.settimeout(timeout)
+                        _t_stage = "send"
+                        json_str = json.dumps(request)
+                        sock.sendall(json_str.encode("utf-8"))
+                        _t_stage = "recv"
+                        chunks = []
+                        while True:
+                            try:
+                                chunk = sock.recv(4096)
+                            except socket.timeout:
+                                return {"code": 102, "data": f"OCR timeout ({timeout}s)"}
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            _t_recv += len(chunk)
+                        _t_stage = "parse"
+                        text = b"".join(chunks).decode("utf-8", errors="ignore")
+                        return self._parse_json(text)
+                except Exception as e:
+                    _err = ("TCP error: %s [阶段=%s 耗时%.2fs 已收=%dB 类型=%s]"
+                            % (e, _t_stage, time.time() - _t_beg,
+                               _t_recv, type(e).__name__))
+                    # 只对「连接层瞬时抖动」透明重发：异常在收发阶段 + 一个字节都没收到。
+                    # 其余情况（解析失败 / 真超时 / 引擎报错）一律原样返回，绝不掩盖真问题。
+                    if _tx >= _TCP_TX_RETRY or _t_stage != "recv" or _t_recv != 0:
+                        return {"code": 102, "data": _err}
+                    print("[NcnnAdapter] 端口 %d 连接在 %s 阶段被中止（响应 0 字节，"
+                          "引擎未处理本页）→ 透明重发 %d/%d"
+                          % (self._server_port, _t_stage, _tx + 1, _TCP_TX_RETRY))
+                    time.sleep(0.03)
+            return {"code": 102, "data": _err}
 
     def _engine_is_ours(self):
         """端口上有响应时，判断响应者是否确为「本对象启动、且仍存活」的那个引擎。
@@ -1275,10 +1425,19 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         会把端口占住 —— 内核替它把连接 SYN 收下（connect 成功），请求却永远等不到
         回复（recv 一直挂到 180 秒超时，GPU 占用率掉到 0）。那种情况下
         self.server_proc 要么为空、要么早已退出，据此即可判定「响应者不是我们的」。
+
+        【2026-10-10 修复·之二】判定依据从「self._started 且进程活着」改成
+        「只看进程句柄」——因为 self._started 会被 _ensure_running() 第 3 步
+        在端口探测失败时**无条件**打掉，而端口探测的超时只有 1 秒、引擎忙时必然
+        失败。于是原先的保护逻辑自我拆台：
+            一次探测失败 → _started=False → _engine_is_ours() 恒为 False
+            → 该实例此后每次请求都在 1 秒内返回「引擎不可用」→ 且永不重启
+            （_ensure_running 按设计不重启）→ 看门狗误当超时 → 整份文件报废。
+        进程句柄才是「归属」的唯一可信依据：server_proc 只由本对象的 Popen 赋值。
         """
         p = self.server_proc
         try:
-            return bool(self._started and p is not None and p.poll() is None)
+            return bool(p is not None and p.poll() is None)
         except Exception:
             return False
 
@@ -1312,6 +1471,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         old = self.server_proc
         self.server_proc = None
         self._started = False
+        self._close_stderr_log()
         self._kill_proc(old)
 
     def _ensure_running(self):
@@ -1324,9 +1484,13 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         也不要留半个坏引擎在旁边。
 
         于是统一语义：
-            引擎不可用 → 本页立即失败返回（code=102 且带 "timeout"）
-                      → 看门狗 Tier1 触发 restart_all() → **两个实例一起重启**
-                      → 同一页重试 → 恢复。
+            引擎不可用 → 本页立即失败返回（code=103，见 _RESULT_ENGINE_UNAVAILABLE）
+                      → 看门狗判定「引擎确实坏了」→ Tier1 触发 restart_all()
+                      → **两个实例一起重启** → 同一页重发 → 恢复。
+        注意（2026-10-10 修复·之六）：只有「103 不可用 / 引擎进程已退出 / 真超时」
+        才走 Tier1。单纯一条连接被 RST（TCP error 10053 / 10054）而进程还活着时，
+        那只是「这一页没拿到结果」，原地重发即可 —— 若也去 restart_all()，
+        会把另一个本来健康的引擎一起杀掉，连带另一个 consumer 的在途请求也断。
 
         附带好处：恢复了「本方法永不 Popen 新进程」这一性质。旧实现直接
         self.start()，而 start() 里 stop() 只按 self.server_proc 杀一个 —— 并发下
@@ -1355,9 +1519,21 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                 self._kill_proc(old)
             return False
         # 3) 进程已死 / 从未起来 → 清掉悬空引用（不在这里重启，交给看门狗）。
+        # 【2026-10-10 修复·之二】到这里时进程**确实**已经不在（步骤 1 已经用
+        #   进程句柄判定过：活着就直接 return True 了），所以置 _started = False
+        #   是对的。但要注意 _started 从此不再是归属的判定依据
+        #   —— 见 _engine_is_ours() 的注释（旧版无条件打掉它，把活着的引擎判死）。
         with self._proc_lock:
             old = self.server_proc
             if old is not None and old.poll() is not None:
+                # 【2026-10-10 修复·之七】把退出码写进引擎日志：本机 WER 已禁用，
+                # 引擎若是原生崩溃（0xC0000005 等），系统里查不到任何痕迹，
+                # 只有这个 returncode 能证明「它是自己崩了，还是被我们杀掉的」。
+                _rc = old.returncode
+                print("[NcnnAdapter] 端口 %d 的引擎进程已退出，returncode=%s"
+                      % (self._server_port, _rc))
+                self._note_stderr("engine exited: returncode=%s"
+                                  " (0xC0000005=访问违例崩溃, 15/1=被终止)" % _rc)
                 self.server_proc = None
             self._started = False
         return False
@@ -1428,6 +1604,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                     pass
             self.server_proc = None
         self._started = False
+        self._close_stderr_log()
 
     def get_dynamic_timeout(self, floor=180, ceiling=300):
         """根据所有活跃引擎实例的历史OCR耗时计算动态超时
@@ -1470,8 +1647,17 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                 return ""
             print(f"[NcnnAdapter] Restarting engine on port {self._server_port}...")
             old = self.server_proc
+            if old is not None and old.poll() is not None:
+                # 【2026-10-10 修复·之七】引擎在我们重启它之前就已经死了 ——
+                # 记下退出码（0xC0000005=访问违例崩溃 / 15、1=被终止 / 0=正常退出）。
+                # 本机 WER 已禁用，这是唯一能区分「崩了」还是「被杀」的痕迹。
+                print("[NcnnAdapter] 端口 %d 的引擎已先退出，returncode=%s"
+                      % (self._server_port, old.returncode))
+                self._note_stderr("engine already exited before restart:"
+                                  " returncode=%s" % old.returncode)
             self.server_proc = None
             self._started = False
+            self._close_stderr_log()
             self._kill_proc(old)
             time.sleep(0.5)  # 等操作系统释放端口
             # 【2026-10-09 修复】端口仍被「不是我们启动的」引擎占着（孤儿/别目录引擎）
@@ -1666,6 +1852,9 @@ class OCRClient:
         self._gpu_device = gpu_device
         self._dual_instance = dual_instance
         self._adapter_index = 0
+        # 【2026-10-10 修复·之六】派发计数器必须原子自增：两个 consumer 并发
+        # 读-改-写 _adapter_index 会算出同一个 idx，把两页同时送进同一个引擎。
+        self._dispatch_lock = threading.Lock()
         self._instances = []
         # 【2026-10-09】记住构造参数：Tier2 全文件重启时要用它把引擎**真正**重建起来
         # （见 rebuild()）。旧实现重建时直接 restart_all()，但那时 _instances 已被
@@ -1699,10 +1888,39 @@ class OCRClient:
     def ocr_image_base64(self, image_base64, timeout_seconds=180):
         """轮询调度多个实例"""
         if self._dual_instance and len(self._instances) > 0:
-            idx = self._adapter_index % len(self._instances)
-            self._adapter_index += 1
+            # 【2026-10-10 修复·之六】原子派发，见 __init__ 里的 _dispatch_lock
+            with self._dispatch_lock:
+                idx = self._adapter_index % len(self._instances)
+                self._adapter_index += 1
             return self._instances[idx].run_base64(image_base64, timeout_seconds)
         return self._instances[0].run_base64(image_base64, timeout_seconds)
+
+    def engines_alive(self):
+        """所有实例的引擎进程是否都还活着（2026-10-10 修复·之六）。
+
+        看门狗靠它区分两种失败：
+          · 引擎进程已退出（崩了 / 被外力杀了）→ 值得重建引擎；
+          · 只是这一条 TCP 连接被 RST、进程还在 → 重发同一页即可。
+        后者若也去 restart_all()，会把**另一个本来健康的引擎**一起杀掉，
+        连带另一个 consumer 的在途请求也断 —— 日志里那对 10053/10054 就是这么来的。
+        没有实例时返回 True（无可判定对象，不因此触发重建）。
+        """
+        insts = list(getattr(self, "_instances", None) or [])
+        if not insts:
+            return True
+        for a in insts:
+            try:
+                chk = getattr(a, "_engine_is_ours", None)
+                if callable(chk):
+                    if not chk():
+                        return False
+                else:
+                    p = getattr(a, "server_proc", None)
+                    if p is not None and p.poll() is not None:
+                        return False
+            except Exception:
+                return False
+        return True
 
     def force_close(self):
         """强制关闭：直接 kill 子进程，立即中断阻塞的 OCR 调用"""
@@ -1823,6 +2041,12 @@ class PDFProcessor:
             self.font = fitz.Font("cjk")
         self._paused = False
         self._cancelled = False
+        # 【2026-10-10 修复·之十一】用户点「取消」的**粘性**标记。
+        # _cancelled 会被下面的「整份文件重处理」逻辑复位成 False，
+        # 所以它不能用来表达「用户明确要求停止」。
+        # _user_cancelled 一旦置位，只有新建 PDFProcessor（= 新的一批任务）才回到 False。
+        self._user_cancelled = False
+        self._pipeline_alive = False    # 消费者线程是否还在跑（取消时决定要不要打断阻塞的 recv）
         self.results = {}
         self.results_lock = threading.Lock()
         self.completed_count = 0
@@ -1849,11 +2073,34 @@ class PDFProcessor:
     def resume(self):
         self._paused = False
     def cancel(self):
+        # 【2026-10-10 修复·之十一】用户取消 = 最高优先级，且**必须与内部重跑区分开**
+        self._user_cancelled = True
         self._cancelled = True
         self._paused = False
-        # 强制中断阻塞的OCR调用
-        if hasattr(self, 'ocr') and self.ocr:
-            self.ocr.force_close()
+        # 旧实现在这里**同步**调用 ocr.force_close()：
+        #   ① 它从 GUI 线程直接杀两个引擎进程 → 界面当场卡住（用户报的「卡住」）；
+        #   ② 消费者线程随即拿到 code=900 + engines_alive()=False →
+        #      走进「引擎坏了 → restart_all() → 重发本页」分支，
+        #      重试预算耗尽后升级成「整份文件重处理」→ 取消被无视、整份重跑。
+        # 现在改成：延迟 3 秒、且**只在流水线确实还没停下时**才去打断阻塞的 recv。
+        # 正常取消（在途请求 1~2 秒就返回）根本不会碰到引擎。
+        try:
+            threading.Thread(target=self._delayed_force_close, daemon=True).start()
+        except Exception:
+            pass
+
+    def _delayed_force_close(self, delay=3.0):
+        # 取消 3 秒后若消费者线程还在跑，才强杀引擎打断阻塞的 recv（不再阻塞 GUI）
+        try:
+            time.sleep(delay)
+        except Exception:
+            return
+        if self._cancelled and self._pipeline_alive:
+            try:
+                print("[OCRClient] 取消后流水线仍未停止 → 强制打断阻塞的 OCR 调用")
+                self.ocr.force_close()
+            except Exception:
+                pass
     def wait_if_paused(self):
         while self._paused and not self._cancelled:
             time.sleep(0.05)
@@ -1893,7 +2140,7 @@ class PDFProcessor:
     # 【2026-10-09 完整性闸门】「有结论」的结果码：
     #   100 = 引擎给出了文字块
     #   101 = 引擎明确回复「本页无文字」（空白页 / 未检出文字）
-    # 其它码（102 超时/引擎错误、900 调用异常）都算「没有结论」——
+    # 其它码（102 超时/引擎错误、103 引擎不可用、900 调用异常）都算「没有结论」——
     # 必须触发重处理，绝不能被当成空白页静默跳过。
     _RESULT_OK_CODES = (100, 101)
 
@@ -1980,7 +2227,7 @@ class PDFProcessor:
         """处理单个PDF文件。output_dir=None时输出到源文件所在目录"""
         if output_dir is None:
             output_dir = os.path.dirname(input_path)
-        if self._cancelled:
+        if self._cancelled or self._user_cancelled:
             return None, None
         print(f"\n[PDFProcessor] Processing: {input_path} ({total_pages} pages, scale={scale}x)")
         self.reset()
@@ -2016,7 +2263,7 @@ class PDFProcessor:
             t0 = time.time()
             # 【2026-10-09】重试计数已改为「每页复位」的局部变量 _page_retry（见下），
             # 不再需要 per-consumer 的 Tier1/Tier2 标志。
-            while my_done < total_pages and not self._cancelled:
+            while my_done < total_pages and not self._cancelled and not self._user_cancelled:
                 try:
                     pn, b64_data = render_queue.get(timeout=0.3)
                 except Empty:
@@ -2030,7 +2277,15 @@ class PDFProcessor:
                 #   ② 仍卡住        → 触发整份文件重处理（外层循环）；
                 #   ③ 文件也重试用尽 → 跳过该文件 + 写警告文件。
                 _page_retry = 0
+                # 本页「因引擎确实坏了而重建引擎」的次数。它**不消耗** _page_retry：
+                # 引擎崩了/不可用是基础设施问题，不该把这一页的重试预算也吃掉
+                # （否则崩一次就升级成整份文件重跑）。每页最多 1 次。
+                _engine_recover = 0
                 while True:
+                    # 【2026-10-10 修复·之十一】用户取消优先级最高：立刻放弃本页，
+                    # 绝不进入下面的「重建引擎 / 重发本页 / 升级整份重跑」分支。
+                    if self._user_cancelled:
+                        return
                     # 动态超时：取实例0的 get_dynamic_timeout（已聚合所有活跃引擎的耗时）
                     # 【2026-10-09】force_close 会并发清空 _instances，这里必须防空，
                     # 否则看门狗自己会抛 IndexError（那是"看门狗被自己弄崩"，不是被锁搞坏）
@@ -2046,28 +2301,85 @@ class PDFProcessor:
                     # 超时判定（引擎假死：code=102 且 data 含 "timeout"）—— 原判定式保留
                     _is_timeout = (result.get("code") == 102
                                    and "timeout" in str(result.get("data", "")).lower())
+                    # 【2026-10-10 修复·之一】把「引擎不可用」单独识别出来。
+                    # 它跟真超时是两回事：真超时是引擎卡满 180 秒；不可用是
+                    # _ensure_running() 判定失败、约 1 秒就返回。旧版把两者混为一谈，
+                    # 日志才会打出「超时 1s (limit=180s)」这种自相矛盾的记录。
+                    _is_unavailable = (result.get("code")
+                                       == _RESULT_ENGINE_UNAVAILABLE)
+                    # 【2026-10-10 修复·之六】哪些失败「重建引擎才有救」：
+                    #   · 103 引擎不可用 —— 进程已死 / 被占位者挡住；
+                    #   · 任一实例的引擎进程已退出 —— 崩了（本机 WER 关着，系统里
+                    #     查不到，只能靠 poll() 抓出来）；
+                    #   · 真超时（下面单独判）。
+                    # 只有这几类才值得重建。**光有一条连接被 RST（TCP error
+                    # 10053/10054）而进程还活着时，绝不重建** —— 2026-10-10 那份
+                    # 715 页日志证明：每次都 restart_all()，会把另一个健康引擎一起
+                    # 杀掉，另一个 consumer 的在途请求也跟着断（成对的 10053+10054），
+                    # 一次抖动付两次代价、日志全是重启刷屏。
+                    _engine_fault = (result.get("code")
+                                     in _RESULT_ENGINE_ERROR_CODES)
+                    # 用 getattr 取：单测里注入的假 OCR 对象没有这个方法，
+                    # 缺它就当作「无法判定 → 不因此重建」，绝不让看门狗自己抛异常。
+                    _alive = getattr(self.ocr, "engines_alive", None)
+                    _engines_dead = (not _alive()) if callable(_alive) else False
                     # 本页是否「没有拿到有效结论」：
                     #   100=引擎给出文字块 / 101=引擎明确回复本页无文字（空白页）→ 有结论
-                    #   102 超时或其它引擎错、900 调用异常 → 没有结论，必须重新处理该页
+                    #   102/103 引擎层故障、900 调用异常 → 没有结论，必须重新处理该页
                     _page_failed = result.get("code") not in self._RESULT_OK_CODES
                     if not _page_failed:
                         break                    # 有结论 → 退出恢复循环，正常入库
-                    if _is_timeout:
+                    # 【2026-10-10 修复·之十一】本页没有结论，但用户已经点了取消 →
+                    # 立刻收手。否则这里会去 restart_all() 重建引擎并重发，
+                    # 把取消彻底变成「程序自己重跑一遍」。
+                    if self._user_cancelled:
+                        return
+                    if _is_unavailable:
+                        print("[Watchdog] Consumer-%d Page %d 引擎不可用"
+                              "（约 1 秒返回，不是 180 秒超时）: %s"
+                              % (consumer_id, pn + 1,
+                                 str(result.get("data", ""))[:120]))
+                    elif _is_timeout:
                         elapsed = time.time() - t_page
                         print(f"[Watchdog] Consumer-{consumer_id} Page {pn+1} 超时 {elapsed:.0f}s (limit={timeout_sec}s)")
                     else:
-                        print("[Watchdog] Consumer-%d Page %d 出错 code=%s: %s"
+                        # 【2026-10-10 修复·之八】把「连接被重置」和「引擎真的坏了」分开讲。
+                        # code=102 在真超时之外只剩 TCP error（10053/10054）：那只说明
+                        # 这一条连接断了，引擎进程往往完全健康、原地重发即可 ——
+                        # 绝不该让用户以为「引擎坏了」。旧文案一律打「引擎层故障=True」，
+                        # 用户为此连问三次「引擎层故障是怎么回事」。
+                        _data_l = str(result.get("data", ""))
+                        _kind = ("连接被重置，本页将原地重发（引擎进程正常）"
+                                 if "tcp error" in _data_l.lower()
+                                 else "引擎层错误")
+                        print("[Watchdog] Consumer-%d Page %d 出错 code=%s（%s）: %s"
                               % (consumer_id, pn + 1, result.get("code"),
-                                 str(result.get("data", ""))[:120]))
+                                 _kind, _data_l[:120]))
+                    if (_is_unavailable or _engines_dead) and _engine_recover < 1:
+                        # 【2026-10-10 修复·之六】引擎确实坏了 → 重建两个引擎后
+                        # **重发同一页**。这次重建不消耗页级重试预算（它是基础设施
+                        # 恢复，不是"这一页又试了一次"），否则引擎崩一次就足以把
+                        # 重试次数用光、直接升级成整份文件重跑。每页最多 1 次。
+                        _engine_recover += 1
+                        print("[Watchdog] Tier1: restarting ALL engine instances"
+                              "（%s；重建后重发本页，不计入页重试）"
+                              % ("引擎不可用" if _is_unavailable
+                                 else "引擎进程已退出"))
+                        self.ocr.restart_all()
+                        continue
                     if _page_retry < self.MAX_PAGE_RETRY:
                         # ① 重新处理该页（最多 MAX_PAGE_RETRY 次）
                         _page_retry += 1
-                        print("[Watchdog] → 第 %d/%d 次重新处理第 %d 页"
-                              % (_page_retry, self.MAX_PAGE_RETRY, pn + 1))
+                        print("[Watchdog] → 重发第 %d 页（第 %d/%d 次；页号不连续是"
+                              "并行渲染分段所致，不代表跳过了前面的页）"
+                              % (pn + 1, _page_retry, self.MAX_PAGE_RETRY))
                         if _is_timeout:
-                            # 超时 = 引擎假死，必须重启「全部引擎」才能真正恢复
-                            # （不做单实例重启：两个引擎要么都活着，要么一起重建）
-                            print("[Watchdog] Tier1: restarting ALL engine instances")
+                            # 【2026-10-10 修复·之六】真超时 = 引擎假死
+                            # （进程活着但 180 秒不回复）→ 必须先重建两个引擎，
+                            # 重试才有意义。而「连接被 RST」（10053/10054）不算，
+                            # 那种情况引擎进程好好的，原地重发就够了。
+                            print("[Watchdog] Tier1: restarting ALL engine instances"
+                                  "（真超时 → 引擎假死）")
                             self.ocr.restart_all()
                         continue
                     # ② 单页重试用尽 → 触发全文件重处理（外层 for _full_retry 循环）
@@ -2078,7 +2390,8 @@ class PDFProcessor:
                     self.ocr.force_close()
                     return
                 # 正常/超时恢复成功：存结果
-                if not self._need_restart and not self._cancelled:
+                if (not self._need_restart and not self._cancelled
+                        and not self._user_cancelled):
                     with self.results_lock:
                         self.results[pn] = result
                         done_pages[pn] = True
@@ -2113,6 +2426,9 @@ class PDFProcessor:
             # 队列反压：maxsize控制预渲染量，避免撑爆内存
             # 满队列时put()自动阻塞→渲染线程等待→自然调节投喂速度
             print(f"[PDFProcessor] {n_workers} render threads, queue={render_queue.maxsize} (CPU={cpu_cores}, dual={num_consumers>1})")
+            print(f"[PDFProcessor] 提示：{n_workers} 个渲染线程并行分段渲染，"
+                                  f"识别队列的页号不会连续（例如先出现第 470 页、再回到第 90 页），"
+                                  f"这是并行的正常现象，不代表跳过或乱序处理。")
             workers_per_thread = (total_pages + n_workers - 1) // n_workers
             producers = []
             self._num_workers = 0
@@ -2134,15 +2450,22 @@ class PDFProcessor:
                 c.daemon = True
                 c.start()
                 consumers.append(c)
+            self._pipeline_alive = True
             for c in consumers:
                 c.join()
             for t in producers:
                 t.join()
+            self._pipeline_alive = False
+            # 【2026-10-10 修复·之十一】用户取消 → 本文件就此作废，直接返回 None,None。
+            # 绝不落到下面的「完整性闸门 / 整份文件重处理」——那正是取消被无视的元凶。
+            if self._user_cancelled:
+                print("[Watchdog] 用户已取消 → 放弃本文件（不重跑、不生成结果）")
+                return None, None
             # 【2026-10-09 完整性闸门】用户要求：宁可整份文件重跑，也绝不交付
             # 错页 / 漏页 / 乱序的结果。这里是输出前的最后一道校验。
             # （页序本身是安全的：write_results 用 sorted(results.keys()) 按页码升序写，
             #   结果也是按页码 pn 存进 dict 的；乱序只可能来自「缺页」，而缺页会被这里拦住。）
-            if not self._cancelled:
+            if not self._cancelled and not self._user_cancelled:
                 _bad = self._incomplete_pages(total_pages)
                 if _bad:
                     _show = "、".join(str(p + 1) for p in _bad[:10])
@@ -2156,7 +2479,10 @@ class PDFProcessor:
                     else:
                         print("[Watchdog] → 全文件重处理已用尽 → 跳过本文件并生成警告文件")
                     self._need_restart = True
-            if self._need_restart and _full_retry < self.MAX_FILE_RETRY:
+            # 【2026-10-10 修复·之十一】用户取消时绝不允许进入「整份文件重处理」——
+            # 这一条以前无条件执行，会把 _cancelled 复位成 False，于是取消 = 从头重跑。
+            if (self._need_restart and not self._user_cancelled
+                    and _full_retry < self.MAX_FILE_RETRY):
                 print(f"[Watchdog] Full file restart #{_full_retry+1} triggered. Cleaning up...")
                 self._cancelled = True
                 self.ocr.force_close()
@@ -5003,8 +5329,22 @@ class MainWindow(QMainWindow):
             self.exit_mini_mode()      # 处理完成 → 自动还原完整窗口
         self._safety_timer.stop()
         self._speed_timer.stop()
-        self.log(f"\n处理完成! 成功: {success}/{total}")
         self._set_buttons_idle()
+        # 【2026-10-10 修复·之十一】用户中途取消 ≠ 处理完成。
+        # 旧版无论怎么结束都弹「批量处理完成!」，取消后看着像跑完了。
+        _was_cancelled = bool(self.worker and getattr(self.worker, "is_cancelled", False))
+        if _was_cancelled:
+            self.log(f"\n已取消。本批已完成 {success}/{total} 个文件（剩余未处理）")
+            self.status_label.setText(f"已取消 - 已完成 {success}/{total}")
+            self.speed_label.setText("处理速度: -- (已取消)")
+            self.overall_progress.setValue(int((self.processed_files / self.total_files) * 10000)
+                                           if self.total_files else 0)
+            QMessageBox.information(
+                self, "已取消",
+                f"已取消本批任务。\n\n已完成: {success}/{total} 个文件"
+                f"\n输出目录: {self.output_edit.text()}")
+            return
+        self.log(f"\n处理完成! 成功: {success}/{total}")
         self.status_label.setText(f"完成 - 成功 {success}/{total}")
         self.overall_progress.setValue(10000)
         self.speed_label.setText("处理速度: -- (已完成)")
@@ -5572,7 +5912,97 @@ def _force_cleanup():
     _kill_engine_processes(CLEANUP_TARGETS)
 
 
+# ============================================================
+# 【2026-10-10 新增】运行日志落盘（Tee）
+#   启动器只把主程序的 stdout/stderr 显示在日志窗口里，**不写文件**：
+#   窗口一关（或强杀）日志就没了，事后无法复盘。
+#   这里把 print 出去的内容**同时**追加进
+#       <软件根目录>/logs/<TAG>-YYYY-MM-DD.log
+#   纯旁路：不改变任何原有行为；目录不可写时静默跳过。
+# ============================================================
+class _LogTee:
+    """把写入镜像到日志文件，同时原样透传给原 stdout/stderr。"""
+
+    def __init__(self, stream, handle):
+        self._stream = stream
+        self._handle = handle
+        self._lock = threading.Lock()
+
+    def write(self, data):
+        if not isinstance(data, str):
+            try:
+                data = str(data)
+            except Exception:
+                return 0
+        try:
+            if self._stream is not None:
+                self._stream.write(data)
+        except Exception:
+            pass
+        if data:
+            try:
+                with self._lock:
+                    self._handle.write(data)
+                    self._handle.flush()
+            except Exception:
+                pass
+        return len(data)
+
+    def writelines(self, lines):
+        for ln in lines:
+            self.write(ln)
+
+    def flush(self):
+        try:
+            if self._stream is not None:
+                self._stream.flush()
+        except Exception:
+            pass
+        try:
+            with self._lock:
+                self._handle.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return False
+
+
+_LOG_TEE_FILE = None
+
+
+def _install_file_log(tag):
+    """把 stdout / stderr 复制一份到 <软件根目录>/logs/<tag>-YYYY-MM-DD.log"""
+    global _LOG_TEE_FILE
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        log_dir = os.path.join(root, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "%s-%s.log" % (tag, time.strftime("%Y-%m-%d")))
+        _LOG_TEE_FILE = open(path, "a", encoding="utf-8", buffering=1,
+                             errors="replace")
+    except Exception:
+        _LOG_TEE_FILE = None
+        return None
+    try:
+        sys.stdout = _LogTee(sys.stdout, _LOG_TEE_FILE)
+        sys.stderr = _LogTee(sys.stderr, _LOG_TEE_FILE)
+    except Exception:
+        pass
+    try:
+        _LOG_TEE_FILE.write(
+            "\n" + "=" * 72 + "\n"
+            + "[%s] ======== 程序启动（pid=%d）========" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid()) + "\n"
+            + "[log] 日志文件: %s\n" % path)
+        _LOG_TEE_FILE.flush()
+    except Exception:
+        pass
+    return path
+
+
 if __name__ == '__main__':
+    _install_file_log("CathayOCR-Pro")   # 2026-10-10：运行日志落盘（旁路，不影响启动）
     # 启动前清理『本软件目录内』的残余引擎进程
     # 【修复】不再按进程名全局强杀，避免误伤其它目录正在运行的同类程序
     _kill_engine_processes(CLEANUP_TARGETS)
