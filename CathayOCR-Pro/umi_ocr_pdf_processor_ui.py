@@ -2061,7 +2061,7 @@ class MiniWindow(QWidget):
     """
     restore_requested = pyqtSignal()
     on_top_changed = pyqtSignal(bool)      # 置顶开关变化（主窗口负责记住这个选择）
-    CARD_W, CARD_H = 420, 118
+    CARD_W, CARD_H = 420, 146
 
     def __init__(self):
         super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -2131,8 +2131,37 @@ class MiniWindow(QWidget):
         self.file_label.setStyleSheet("color:#334155;font-size:11px;")
         v.addWidget(self.file_label)
 
+        # ── 当前文件（本 PDF）的页进度 ──
+        #    数据与启动器日志窗口里的「[合计] x/y 页」同源（
+        #    worker.file_progress 信号：已识别页数 / 该 PDF 总页数）。
+        row_file = QHBoxLayout()
+        row_file.setSpacing(9)
+        self.page_tag = QLabel("本文件")
+        self.page_tag.setStyleSheet("color:#8a97a6;font-size:10px;")
+        self.page_tag.setFixedWidth(34)
+        row_file.addWidget(self.page_tag)
+        self.page_bar = QProgressBar()
+        self.page_bar.setRange(0, 1000)
+        self.page_bar.setTextVisible(False)
+        self.page_bar.setFixedHeight(8)
+        self.page_bar.setStyleSheet(
+            "QProgressBar{background:#eef2f7;border:none;border-radius:4px;}"
+            "QProgressBar::chunk{background:#34a853;border-radius:4px;}")
+        row_file.addWidget(self.page_bar, 1)
+        self.page_label = QLabel("— / — 页")
+        self.page_label.setStyleSheet("color:#5b6b7c;font-size:10px;")
+        self.page_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.page_label.setMinimumWidth(96)
+        row_file.addWidget(self.page_label)
+        v.addLayout(row_file)
+
+        # ── 整个任务的进度（文件数） ──
         row = QHBoxLayout()
         row.setSpacing(9)
+        self.total_tag = QLabel("总进度")
+        self.total_tag.setStyleSheet("color:#8a97a6;font-size:10px;")
+        self.total_tag.setFixedWidth(34)
+        row.addWidget(self.total_tag)
         self.bar = QProgressBar()
         self.bar.setRange(0, 1000)
         self.bar.setTextVisible(False)
@@ -2149,8 +2178,13 @@ class MiniWindow(QWidget):
         v.addLayout(row)
 
     # ---------- 对外接口 ----------
-    def set_state(self, app_name, file_name, done, total, pct, processing):
-        """刷新卡片内容。processing=False 时显示「等待用户安排 OCR 任务」。"""
+    def set_state(self, app_name, file_name, done, total, pct, processing,
+                  page_done=0, page_total=0):
+        """刷新卡片内容。processing=False 时显示「等待用户安排 OCR 任务」。
+
+        page_done / page_total = **当前这个 PDF** 已识别页数 / 总页数，
+        与启动器日志窗口里的「[合计] x/y 页」同源。
+        """
         try:
             self.app_label.setText(str(app_name))
         except Exception:
@@ -2172,9 +2206,25 @@ class MiniWindow(QWidget):
             self.count_label.setText("已处理 %d / %d" % (done, total))
         else:
             self.count_label.setText("— / —")
+        # ── 当前文件的页进度 ──
         try:
-            self.setToolTip("%s\n%s\n已处理 %d / %d 个文件（%.0f%%）"
-                            % (app_name, file_name, done, total, float(pct) * 100))
+            _pd = max(0, int(page_done or 0))
+            _pt = max(0, int(page_total or 0))
+        except Exception:
+            _pd, _pt = 0, 0
+        if _pt > 0:
+            self.page_bar.setValue(max(0, min(1000, int(_pd * 1000.0 / _pt))))
+            self.page_label.setText("第 %d / %d 页 (%.0f%%)"
+                                    % (_pd, _pt, _pd * 100.0 / _pt))
+        else:
+            self.page_bar.setValue(0)
+            self.page_label.setText("准备中…" if processing else "— / — 页")
+        try:
+            self.setToolTip("%s\n%s\n本文件：%s / %s 页\n已处理 %d / %d 个文件（%.0f%%）"
+                            % (app_name, file_name,
+                               str(_pd) if _pt > 0 else "—",
+                               str(_pt) if _pt > 0 else "—",
+                               done, total, float(pct) * 100))
         except Exception:
             pass
 
@@ -3175,6 +3225,7 @@ class MainWindow(QMainWindow):
         self._safety_timer.setSingleShot(True)
         self._job_start_time = 0
         self._job_completed_pages = 0
+        self._job_total_pages = 0
         self._last_speed_pages = 0
         self._last_speed_time = 0
         self.setAcceptDrops(True)
@@ -4538,6 +4589,7 @@ class MainWindow(QMainWindow):
         self._set_buttons_processing()
         self._job_start_time = time.time()
         self._job_completed_pages = 0
+        self._job_total_pages = 0
         self._last_speed_pages = 0
         self._last_speed_time = self._job_start_time
         self._speed_timer.start(5000)
@@ -4569,6 +4621,7 @@ class MainWindow(QMainWindow):
         pct = int((ocr_completed / total) * 100) if total > 0 else 0
         self.page_info_label.setText(f"OCR完成 {ocr_completed} / {total} 页 ({pct}%)")
         self._job_completed_pages = ocr_completed
+        self._job_total_pages = int(total or 0)      # 当前 PDF 总页数（迷你卡片用）
         self._safety_timer.start(600000)
         if total > 0:
             self.page_progress.setValue(int((ocr_completed / total) * 10000))
@@ -4839,8 +4892,15 @@ class MainWindow(QMainWindow):
             pct = self.overall_progress.value() / 10000.0
         except Exception:
             pct = 0.0
+        # 页进度：仅在处理中上报，否则给 0（卡片显示「— / — 页」）
+        if bool(self._processing):
+            pg_done = int(getattr(self, "_job_completed_pages", 0) or 0)
+            pg_total = int(getattr(self, "_job_total_pages", 0) or 0)
+        else:
+            pg_done = pg_total = 0
         return (self.APP_DISPLAY_NAME, self._current_file_name,
-                done, tot, pct, bool(self._processing))
+                done, tot, pct, bool(self._processing),
+                pg_done, pg_total)
 
     def _mini_refresh(self):
         """把当前进度推给迷你卡片（没开迷你模式时什么都不做）。"""
