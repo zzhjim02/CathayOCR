@@ -80,6 +80,16 @@ GWL_EXSTYLE       = -20
 WS_EX_TOOLWINDOW  = 0x00000080
 WS_EX_APPWINDOW   = 0x00040000
 
+# Win32：窗口归属（owner）—— 2026-10-09 新增
+#   把日志窗口登记成「主程序的从属窗口」后，Windows 会把两者当成一个整体：
+#     · 主窗口被激活 / 点任务栏图标 → 日志窗口一起跟上来（不会再出现
+#       「主窗口在第三方窗口上面、日志窗口却被压在下面」这种被拆散的状态）；
+#     · 主窗口最小化或隐藏 → 日志窗口自动跟着隐藏。
+GWLP_HWNDPARENT   = -8
+SWP_NOSIZE        = 0x0001
+SWP_NOMOVE        = 0x0002
+SWP_NOACTIVATE    = 0x0010
+
 # 两种布局下的按钮文字（顺序与创建顺序一致：滚动/保存/清空/结束/吸附）
 BTN_LABELS_NORMAL = ("暂停滚动", "保存日志", "清空", "结束任务并退出", "⇥ 吸附侧边")
 BTN_LABELS_DOCK   = ("滚动", "保存", "清空", "结束任务", "⇤ 独立")
@@ -193,6 +203,53 @@ def _set_tool_window(hwnd, enable=True):
             new = (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
         if new != style:
             u.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
+        return True
+    except Exception:
+        return False
+
+
+def _hwnd_val(h):
+    """把 ctypes 的 HWND / c_void_p / int 统一取成整数句柄（取不到给 0）。"""
+    if h is None:
+        return 0
+    v = getattr(h, "value", None)
+    if v is None:
+        try:
+            v = int(h)
+        except Exception:
+            return 0
+    try:
+        return int(v or 0)
+    except Exception:
+        return 0
+
+
+def _set_owner(hwnd, owner_hwnd):
+    """把 hwnd 的「所有者(owner)」设为 owner_hwnd —— 两个窗口从此是一个整体。
+
+    对顶层窗口调用 SetWindowLongPtrW(GWLP_HWNDPARENT) 设置的是 **owner**（不是父窗口）。
+    Windows 会把 owner 和它的 owned 窗口放进同一个激活组：
+      · 点主窗口 / 点任务栏图标 → 日志窗口一起跟到最前；
+      · 主窗口最小化或被隐藏   → 日志窗口自动跟着隐藏。
+    这样就不会再出现「主窗口在第三方窗口上面、日志窗口却被压在下面」的拆散状态。
+    """
+    me, owner = _hwnd_val(hwnd), _hwnd_val(owner_hwnd)
+    if not sys.platform.startswith("win") or not me or not owner:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = _user32()
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            fn = u.SetWindowLongPtrW
+            fn.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            fn.restype = ctypes.c_void_p
+            fn(wintypes.HWND(me), GWLP_HWNDPARENT, ctypes.c_void_p(owner))
+        else:
+            fn = u.SetWindowLongW
+            fn.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+            fn.restype = wintypes.LONG
+            fn(wintypes.HWND(me), GWLP_HWNDPARENT, wintypes.LONG(owner))
         return True
     except Exception:
         return False
@@ -589,6 +646,8 @@ class LauncherApp:
         self._hwnd_cache = None
         self._tool_win_applied = False
         self._exit_left = 0.0       # 退出倒计时剩余秒数
+        self._owner_applied = 0     # 已绑定的主窗口句柄（0=还没绑定）
+        self._last_raise = 0.0      # 上次「点日志窗→把主窗一起提前」的时间戳（防抖）
 
         root.title(APP_TITLE)
         root.configure(bg=BG)
@@ -647,6 +706,8 @@ class LauncherApp:
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<Unmap>", self._on_unmap)
+        # 点日志窗口 → 把主程序窗口一起提到前面（两窗是一个整体，见 _on_log_focus）
+        root.bind("<FocusIn>", self._on_log_focus, add="+")
 
         self._log("info", "CathayOCR Lite 启动器 v1.3.0")
         self._log("dim", "项目目录 : %s" % ROOT_DIR)
@@ -787,6 +848,13 @@ class LauncherApp:
         try:
             hwnd = self._own_hwnd()
             if hwnd:
+                # 0) 和主程序窗口绑定成「一个整体」（owner 关系，只做一次）
+                mh = self._ensure_main_hwnd()
+                if mh and self._owner_applied != mh:
+                    if _set_owner(hwnd, mh):
+                        self._owner_applied = mh
+                        self._log("dim", "[布局] 日志窗口已与主程序绑定为一个整体"
+                                        "（会跟着它一起前置 / 一起收起）")
                 # 1) 窗口被第二个实例从外部唤起 → 同步 Tk 状态
                 if self._hidden and _user32().IsWindowVisible(hwnd):
                     self._hidden = False
@@ -819,19 +887,62 @@ class LauncherApp:
         self.toggle_dock()
         self._log("dim", "[布局] 未找到主程序窗口，已自动切回独立窗口")
 
+    def _ensure_main_hwnd(self):
+        """拿到主程序主窗口句柄（找不到返回 0）。与是否处于吸附模式无关。
+
+        旧实现只在 _dock_follow() 里查找，于是「独立窗口模式」下
+        _sync_with_main_window() 永远拿不到句柄、窗口同步直接失效。
+        """
+        u = _user32()
+        mh = self._main_hwnd_cache
+        if mh and u.IsWindow(mh):
+            return mh
+        self._main_hwnd_cache = 0
+        self._main_seen_visible = False
+        if self.proc is None or self.proc.poll() is not None:
+            return 0
+        self._main_hwnd_cache = _find_window_of_pid(self.proc.pid)
+        return self._main_hwnd_cache
+
+    def _on_log_focus(self, _evt=None):
+        """用户点了日志窗口 → 把主程序窗口一起提到最前（两个窗口是一个整体）。
+
+        用 SWP_NOACTIVATE：只调整 Z 序、不抢焦点 —— 点日志窗后焦点仍留在日志窗，
+        可以继续看日志；主窗口只是跟着回到最前，不会再出现「主窗口还在、
+        日志窗口却掉到第三方窗口下面」这种被拆散的状态。
+        """
+        now = time.time()
+        if now - self._last_raise < 0.5:      # 防抖：窗口内部的焦点切换不重复触发
+            return
+        self._last_raise = now
+        mh = self._ensure_main_hwnd()
+        if not mh:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u = _user32()
+            u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       ctypes.c_uint]
+            u.SetWindowPos.restype = wintypes.BOOL
+            u.SetWindowPos(wintypes.HWND(_hwnd_val(mh)), None, 0, 0, 0, 0,
+                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        except Exception:
+            pass
+
     def _sync_with_main_window(self):
         """主窗口一旦被最小化/收进托盘，日志窗口跟着收起；还原时一起还原。
 
         只在「主窗口确实显示过至少一次」之后才生效 —— 否则程序启动初期
         主窗口还没建好，会被误判成"已收起"，把日志窗口一起藏掉。
+        （绑定 owner 之后 Windows 本身也会自动跟着隐藏，这里是双保险。）
         """
         if self.finished:
             return
         u = _user32()
-        mh = self._main_hwnd_cache
-        if not mh or not u.IsWindow(mh):
-            self._main_hwnd_cache = 0
-            self._main_seen_visible = False
+        mh = self._ensure_main_hwnd()
+        if not mh:
             return
         shown = bool(u.IsWindowVisible(mh)) and not u.IsIconic(mh)
         if shown:
@@ -842,7 +953,9 @@ class LauncherApp:
                 self._hidden_by_user = False
                 try:
                     self.root.deiconify()
-                    self.root.lift()
+                    # 这里刻意不再 lift()：既然日志窗口已绑定成主窗口的从属窗口，
+                    # Windows 会把它和主窗口一起前置；强行 lift 反而会把它
+                    # 顶到主窗口之上（就是你看到的「一个盖住一个」）。
                 except Exception:
                     pass
             return
@@ -856,15 +969,7 @@ class LauncherApp:
 
     def _dock_follow(self):
         u = _user32()
-        # 主窗口句柄校验 / 重找
-        if self._main_hwnd_cache and not u.IsWindow(self._main_hwnd_cache):
-            self._main_hwnd_cache = 0
-            self._main_seen_visible = False
-        if not self._main_hwnd_cache:
-            if self.proc is None or self.proc.poll() is not None:
-                return
-            self._main_hwnd_cache = _find_window_of_pid(self.proc.pid)
-        mh = self._main_hwnd_cache
+        mh = self._ensure_main_hwnd()
         if not mh:
             return
         import ctypes

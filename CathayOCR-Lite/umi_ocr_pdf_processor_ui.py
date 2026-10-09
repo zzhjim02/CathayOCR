@@ -724,6 +724,9 @@ class OCREngineAdapter(ABC):
 class NcnnVulkanAdapter(OCREngineAdapter):
     """基于 ncnn Vulkan 的通用引擎适配器（原生支持GPU+CPU双模式）"""
 
+    # 【2026-10-09 卡死修复】同一实例两次重启的最小间隔（秒）
+    _RESTART_MIN_INTERVAL = 8.0
+
     def __init__(self, engine_id, plugin_dir, entry_path):
         super().__init__(engine_id, plugin_dir, entry_path)
         self.config_path = os.path.join(plugin_dir, "config.json")
@@ -731,6 +734,12 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         self.port_offset = 0
         self.server_proc = None
         self.lock = threading.Lock()
+        # 【2026-10-09 卡死修复】进程生命周期锁 —— 只保护 server_proc 的「读-改-写」。
+        # 必须与 self.lock 严格分离：self.lock 会被卡在 sock.recv 的线程连续持有
+        # 最多 180 秒，若看门狗重启去抢 self.lock，就会干等 180 秒才动手 ——
+        # 那才是真正废掉看门狗。两把锁绝不嵌套获取。
+        self._proc_lock = threading.Lock()
+        self._last_restart = 0.0
         self.current_config = {}
         self._started = False
         self._use_gpu = True  # 适配器初值；实际由 params['use_gpu'] 覆盖（界面默认「自动(推荐)」）
@@ -952,7 +961,13 @@ class NcnnVulkanAdapter(OCREngineAdapter):
     def _tcp_request(self, request, timeout=180):
         with self.lock:
             if not self._ensure_running():
-                return {"code": 102, "data": "Vulkan server not available"}
+                # 【2026-10-09 修复·之三】这里必须带 "timeout" 关键字。
+                # 看门狗只把「code=102 且 data 里含 timeout」判定为引擎故障，
+                # 并据此触发 Tier1 = restart_all()（两个实例一起重启）。
+                # 若沿用旧的 "Vulkan server not available"，看门狗不会重启，
+                # 这一页会被当成普通错误直接记进结果里 —— 半个引擎坏掉却没人救。
+                # 语义上也没问题：引擎不可用 = 这次请求拿不到任何响应 = 超时。
+                return {"code": 102, "data": "OCR timeout (engine unavailable)"}
             try:
                 with socket.create_connection(("127.0.0.1", self._server_port), timeout=timeout) as sock:
                     sock.settimeout(timeout)
@@ -972,11 +987,69 @@ class NcnnVulkanAdapter(OCREngineAdapter):
             except Exception as e:
                 return {"code": 102, "data": f"TCP error: {str(e)}"}
 
+    def _engine_is_ours(self):
+        """端口上有响应时，判断响应者是否确为「本对象启动、且仍存活」的那个引擎。
+
+        只连得通是不够的：上一次会话被强杀后留下的孤儿引擎（或别的目录里的同类引擎）
+        会把端口占住 —— 内核替它把连接 SYN 收下（connect 成功），请求却永远等不到
+        回复（recv 一直挂到 180 秒超时，GPU 占用率掉到 0）。那种情况下
+        self.server_proc 要么为空、要么早已退出，据此即可判定「响应者不是我们的」。
+        """
+        p = self.server_proc
+        try:
+            return bool(self._started and p is not None and p.poll() is None)
+        except Exception:
+            return False
+
     def _ensure_running(self):
-        if self._server_running():
+        """只做「引擎是否可用」的**检查**，绝不在本方法里自行重启（2026-10-09 修复·之三）。
+
+        为什么改成「只检查、不重启」：
+        本软件是双实例「轮询分页」——不同页发给不同引擎，共用一个递增计数器
+        (_adapter_index)。如果这里只重启「自己这一个」，两个引擎就会进入
+        「一新一旧 / 一好一坏」的不一致状态；用户明确要求：宁可两个一起重启，
+        也不要留半个坏引擎在旁边。
+
+        于是统一语义：
+            引擎不可用 → 本页立即失败返回（code=102 且带 "timeout"）
+                      → 看门狗 Tier1 触发 restart_all() → **两个实例一起重启**
+                      → 同一页重试 → 恢复。
+
+        附带好处：恢复了「本方法永不 Popen 新进程」这一性质。上一版之所以会产出
+        孤儿引擎，正是因为在旧进程还没杀掉时就在这里 _start_gpu()；现在这里一个
+        进程都不建，孤儿来源从根上消失。
+
+        另一处必须保留的判定：_server_running() 的探测超时只有 1 秒，引擎忙时
+        会误判「已死」。所以**先看进程是否还活着**（_engine_is_ours），活着就一律
+        视为可用 —— 否则大文件跑到一半会被误判、把两个引擎都重启掉。
+        """
+        # 1) 我们自己的引擎进程还活着 → 可用。探测超时只是「忙」，不能据此判死。
+        if self._engine_is_ours():
             return True
-        self._start_gpu(self.current_config)
-        return self._started
+        # 2) 进程不在，但端口有人响应 → 响应者是「不是我们启动的」占位引擎
+        #    （上次被强杀留下的孤儿 / 别的目录里的同类程序）。清掉占位者，
+        #    好让接下来「重启全部实例」能真正 bind 上端口。
+        if self._server_running():
+            with self._proc_lock:
+                if self._engine_is_ours():          # 可能别的线程刚修好
+                    return True
+                print("[NcnnAdapter] 端口 %d 被非本进程启动的引擎占用 → 清理占位者"
+                      % self._server_port)
+                dropped = _kill_orphan_engines()
+                if dropped:
+                    print("[NcnnAdapter] 已清理孤儿引擎: %s" % dropped)
+                old = self.server_proc
+                self.server_proc = None
+                self._started = False
+                self._kill_proc(old)
+            return False
+        # 3) 进程已死 / 从未起来 → 清掉悬空引用（不在这里重启，交给看门狗）。
+        with self._proc_lock:
+            old = self.server_proc
+            if old is not None and old.poll() is not None:
+                self.server_proc = None
+            self._started = False
+        return False
 
     def _run_exe(self, img_path, timeout=180):
         """CPU模式：PIPE模式启动子进程，单次请求后退出"""
@@ -1099,6 +1172,38 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         else:
             return self._run_exe(img_path, timeout)
 
+    def _kill_proc(self, proc):
+        """结束「传入的」进程对象（2026-10-09 卡死修复）。
+
+        关键点：以参数为准，而不是读 self.server_proc。
+        调用方一律先抢引用（old = self.server_proc; self.server_proc = None）
+        再调用本方法 —— 这样即使多个线程并发重启，每个线程只杀自己抢到的那个，
+        不会互相覆盖引用，更不会把别人刚建好的进程变成无人回收的孤儿。"""
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def kill_now(self):
+        """立即结束引擎进程（供 force_close / 进程清理使用，2026-10-09 新增）。
+
+        刻意 **不加** self._proc_lock：它的意义就是尽快打断正阻塞在 recv 上的调用，
+        加锁反而可能被另一条重启路径挡住。「抢引用 + 杀对象」的写法本身已避免孤儿。"""
+        old = self.server_proc
+        self.server_proc = None
+        self._started = False
+        self._kill_proc(old)
+
     def stop(self):
         # 清理复用的临时文件
         tmp_path = getattr(self, "_tmp_path", None)
@@ -1155,13 +1260,48 @@ class NcnnVulkanAdapter(OCREngineAdapter):
     def restart(self, params=None):
         """强制重启引擎进程（杀旧进程→重建新进程）
         用于从Vulkan假死中恢复，不改变config。
+
+        【2026-10-09 卡死修复】加 _proc_lock 串行化：原来每个 consumer 线程各跑一份
+        看门狗、都可并发进 restart()，两个线程同时 stop()+start() 会让 server_proc
+        引用互相覆盖，留下没人管的孤儿进程（实测同一端口被两个引擎同时 LISTEN）。
+        另外加抑制窗口，避免两个 consumer 各触发一次 Tier1 把同一引擎重复重启两遍。
+        看门狗的触发条件 / Tier 层级 / 重试次数一律未改，只改"重启时怎么记账"。
         """
-        print(f"[NcnnAdapter] Restarting engine on port {self._server_port}...")
-        self.stop()
-        time.sleep(0.5)  # 等操作系统释放端口
-        if params is None:
-            params = self.current_config
-        return self.start(params)
+        with self._proc_lock:
+            if (self._server_running() and self._engine_is_ours()
+                    and time.time() - self._last_restart < self._RESTART_MIN_INTERVAL):
+                # 另一个线程刚重启过、且**我们自己的**服务确实已恢复 → 直接复用。
+                # （必须带 _engine_is_ours：若端口被孤儿占着，则不能算「已恢复」，
+                #   否则占位者会让恢复流程被抑制窗口挡掉 8 秒。）
+                return ""
+            print(f"[NcnnAdapter] Restarting engine on port {self._server_port}...")
+            old = self.server_proc
+            self.server_proc = None
+            self._started = False
+            self._kill_proc(old)
+            time.sleep(0.5)  # 等操作系统释放端口
+            # 【2026-10-09 修复·之三】端口仍被「不是我们启动的」引擎占着（孤儿/别目录引擎）
+            # → 先清掉占位者。否则 _start_gpu() 里 _server_running() 会假性通过、
+            #   _started 被置 True 看起来"重启成功"，实际请求全打进僵尸实例。
+            if self._server_running() and not self._engine_is_ours():
+                dropped = _kill_orphan_engines()
+                if dropped:
+                    print("[NcnnAdapter] 重启前清理孤儿引擎: %s" % dropped)
+                time.sleep(0.2)
+            if params is not None:
+                self.current_config = params
+            self._use_gpu = self.current_config.get("use_gpu", True)
+            # 刻意不走 self.stop()/self.start()：stop() 会删掉复用的临时 PNG 文件，
+            # 而此刻另一个 consumer 可能刚写完该文件正在等锁 —— 保留原语义即可。
+            try:
+                if self._use_gpu:
+                    err = self._start_gpu(self.current_config)
+                else:
+                    err = self._start_cpu(self.current_config)
+            except Exception as e:
+                err = f"[Error] Engine restart failed: {str(e)}"
+            self._last_restart = time.time()
+            return err
 
     def close(self):
         self.stop()
@@ -1244,6 +1384,15 @@ class OCRClient:
         self._dual_instance = dual_instance
         self._adapter_index = 0
         self._instances = []
+        # 【2026-10-09】记住构造参数：Tier2 全文件重启时要用它把引擎**真正**重建起来
+        # （见 rebuild()）。旧实现重建时直接 restart_all()，但那时 _instances 已被
+        # force_close() 清空 —— 等于什么都没重建，恢复流程形同虚设。
+        self._ctor = {
+            "engine_id": engine_id, "use_gpu": use_gpu,
+            "vertical_text": vertical_text, "limit_side_len": limit_side_len,
+            "model_size": model_size, "use_angle_cls": use_angle_cls,
+            "dual_instance": dual_instance, "extra_params": dict(extra_params),
+        }
         num_instances = 2 if dual_instance else 1
         params = build_engine_params(
             engine_id, use_gpu, vertical_text, limit_side_len,
@@ -1282,32 +1431,88 @@ class OCRClient:
 
     def force_close(self):
         """强制关闭：直接 kill 子进程，立即中断阻塞的 OCR 调用"""
-        for a in getattr(self, "_instances", []):
+        # 【2026-10-09 修复】用 kill_now()（抢引用后杀），不再直接 kill 当前引用 ——
+        # 避免与看门狗重启撞车时把引用覆盖、留下孤儿；先做快照防并发遍历出错。
+        for a in list(getattr(self, "_instances", [])):
             try:
-                if hasattr(a, 'server_proc') and a.server_proc:
-                    a.server_proc.kill()
+                a.kill_now()
             except Exception:
                 pass
         self._instances = []
         self._initialized = False
 
     def restart_single(self, instance_idx):
-        """重启单个引擎实例（用于看门狗Tier1恢复）"""
-        instances = getattr(self, "_instances", [])
-        if instance_idx < len(instances):
-            try:
-                instances[instance_idx].restart()
-            except Exception as e:
-                print(f"[OCRClient] restart_single({instance_idx}) failed: {e}")
+        """【2026-10-09 语义统一】保留本方法只为兼容旧调用，**不再真的只重启一个**。
+
+        双实例是轮询分页，只重启其中一个会让两个引擎处于「一新一旧」的不一致状态；
+        用户明确要求「宁可两个一起重启」。所以这里直接转成 restart_all()。
+        （说明：本方法在当前代码里没有任何调用方，看门狗走的本来就是 restart_all。）
+        """
+        print("[OCRClient] restart_single → 统一改为重启全部实例")
+        self.restart_all()
 
     def restart_all(self):
-        """重启全部引擎实例（用于看门狗Tier2恢复）"""
-        instances = getattr(self, "_instances", [])
+        """重启全部引擎实例（看门狗 Tier1；也是本程序唯一的引擎恢复路径）"""
+        # 【2026-10-09 修复】先做快照：force_close() 可能并发把 _instances 清空，
+        # 直接遍历原列表会漏掉中途新建的实例。实例内部的并发由各自的 _proc_lock 兜住。
+        instances = list(getattr(self, "_instances", []))
         for i, a in enumerate(instances):
             try:
                 a.restart()
             except Exception as e:
                 print(f"[OCRClient] restart_all[{i}] failed: {e}")
+
+    def rebuild(self):
+        """按原构造参数**真正重建**全部引擎实例（Tier2 全文件重启专用）。
+
+        【2026-10-09 修复】原全文件重启流程是：force_close()（它会清空 _instances）
+        → restart_all()。而 restart_all() 遍历的正是那个已被清空的列表 ——
+        等于**一个引擎都没重建**；接着新线程一跑，ocr_image_png() 就会
+        取 self._instances[0] 抛 IndexError，整份文件全是错误结果。
+        也就是说「全文件重启」这条恢复路以前是**不可用**的，现在补上。
+        """
+        ctor = getattr(self, "_ctor", None)
+        if not ctor:
+            # 没有记录构造参数（极老的对象）→ 退化成重启现有实例
+            return self.restart_all()
+        # 先清掉可能占住端口的孤儿引擎，保证新引擎能 bind 上
+        try:
+            _dropped = _kill_orphan_engines()
+            if _dropped:
+                print("[OCRClient] rebuild 前清理孤儿引擎: %s" % _dropped)
+        except Exception:
+            pass
+        for a in list(getattr(self, "_instances", [])):
+            try:
+                a.kill_now()
+            except Exception:
+                pass
+        self._instances = []
+        self._initialized = False
+        try:
+            params = build_engine_params(
+                ctor["engine_id"], ctor["use_gpu"], ctor["vertical_text"],
+                ctor["limit_side_len"], ctor["model_size"], ctor["use_angle_cls"],
+                ctor["extra_params"])
+        except Exception as e:
+            print(f"[OCRClient] rebuild 参数构建失败: {e}")
+            return "rebuild failed"
+        num_instances = 2 if ctor["dual_instance"] else 1
+        for i in range(num_instances):
+            try:
+                adapter = create_engine_adapter(ctor["engine_id"])
+                if hasattr(adapter, "set_port_offset"):
+                    adapter.set_port_offset(i * 10)   # 实例0: 18043, 实例1: 18053
+                err = adapter.start(params)
+                if err:
+                    print(f"[OCRClient] rebuild 实例{i+1}启动失败: {err}")
+                self._instances.append(adapter)
+            except Exception as e:
+                print(f"[OCRClient] rebuild 实例{i+1}异常: {e}")
+        self.adapter = self._instances[0] if self._instances else None
+        self._initialized = True
+        print(f"[OCRClient] rebuild 完成：{len(self._instances)} 个实例")
+        return ""
 
     def close(self):
         for a in getattr(self, "_instances", []):
@@ -1396,6 +1601,100 @@ class PDFProcessor:
         pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY)
         return pix.tobytes("png")
 
+    # 【2026-10-09 恢复策略（用户定稿，2026-10-09 深夜每层各减 1 次）】
+    #   ① 某页出错 / 超时到 180 秒 → 重新处理该页，最多 MAX_PAGE_RETRY 次（=1）；
+    #   ② 仍卡住                  → 重新处理整份文件，最多 MAX_FILE_RETRY 次（=1）；
+    #   ③ 仍不行                  → 跳过该文件，并在源文件所在文件夹生成一份警告文件。
+    # 计次含义：MAX_*_RETRY 是「**重试**次数」，不含首跑。
+    #   → 页级最多尝试 1+1=2 次；文件级最多跑 1+1=2 遍。
+    MAX_PAGE_RETRY = 1
+    MAX_FILE_RETRY = 1
+
+    # 【2026-10-09 完整性闸门】「有结论」的结果码：
+    #   100 = 引擎给出了文字块
+    #   101 = 引擎明确回复「本页无文字」（空白页 / 未检出文字）
+    # 其它码（102 超时/引擎错误、900 调用异常）都算「没有结论」——
+    # 必须触发重处理，绝不能被当成空白页静默跳过。
+    _RESULT_OK_CODES = (100, 101)
+
+    def _incomplete_pages(self, total_pages):
+        """返回「没有有效结果」的页码列表（0 基）。
+
+        判定标准（用户要求：宁可整份文件重跑，也绝不交付错页/漏页/乱序结果）：
+          1. 该页码在 results 里**根本不存在** —— 页面被彻底漏掉
+             （渲染线程异常退出、线程在重启中提前返回等）；
+          2. 结果码不在 _RESULT_OK_CODES 里 —— 引擎没给出结论
+             （典型：Tier1 重启引擎时，另一个 consumer 正在等的请求被
+               socket 断开打断，那一页以 code=102 落库）。
+        写入阶段 write_results 对 `code != 100` 是直接 continue 的，
+        也就是说这些页会被**静默丢弃**、不留任何痕迹 —— 这正是漏页的真正来源。
+        """
+        bad = []
+        for pn in range(total_pages):
+            r = self.results.get(pn)
+            if r is None or r.get("code") not in self._RESULT_OK_CODES:
+                bad.append(pn)
+        return bad
+
+    def _write_failure_notice(self, input_path, output_dir, total_pages, bad_pages):
+        """在**源文件所在文件夹**写一份警告文件（写不进去则退到输出目录）。
+
+        【2026-10-09 用户要求】单页重试 MAX_PAGE_RETRY 次 + 整份文件重处理 MAX_FILE_RETRY 次
+        仍不成功时，跳过该文件，但必须让用户明确知道「这份文件没处理成功、也没有产出结果」——
+        就在它自己所在的文件夹里留一份警告，文件名一眼可见。
+        """
+        name = Path(input_path).stem
+        _fname = f"{name}_OCR未完成警告.txt"
+        _show = "、".join(str(p + 1) for p in bad_pages[:30])
+        if len(bad_pages) > 30:
+            _show += " …"
+        lines = [
+            "=" * 64,
+            "CathayOCR 处理未完成 —— 请重新处理本文件",
+            "=" * 64,
+            f"源文件   : {os.path.abspath(input_path)}",
+            f"生成时间 : {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"总页数   : {total_pages}",
+            "",
+            "【结果】本文件**没有**生成 OCR 结果文件（*_layered.pdf / *_result.txt）。",
+            "       为避免交付一份「少了几页却看不出来」的结果，程序主动放弃了输出。",
+            "",
+            f"【问题页】共 {len(bad_pages)} 页没有拿到有效结果（页码从 1 计）：",
+            f"   {_show}",
+            "",
+            "【已尝试的恢复步骤（全部用尽）】",
+            f"   1) 重新处理单页   ：最多 {self.MAX_PAGE_RETRY} 次（超时前会重启全部 OCR 引擎）",
+            f"   2) 重新处理整份文件：最多 {self.MAX_FILE_RETRY} 次",
+            "   3) 仍不成功         → 跳过本文件并生成本警告",
+            "",
+            "【建议】",
+            "   · 直接把本文件重新加入待处理列表再跑一次（多数情况是引擎临时假死，重跑即可）；",
+            "   · 若每次都是同样的页码失败，请先检查该页扫描件是否损坏 / 空白 / 分辨率异常；",
+            "   · 若多份文件接连出现同样问题，请关闭软件后重新打开（顺带清掉残留的引擎进程）。",
+            "",
+            "（本文件由程序自动生成，确认后可自行删除。）",
+            "=" * 64,
+            "",
+        ]
+        content = "\n".join(lines)
+        dirs = []
+        src_dir = os.path.dirname(os.path.abspath(input_path))
+        if src_dir:
+            dirs.append(src_dir)
+        if output_dir:
+            od = os.path.abspath(output_dir)
+            if od not in dirs:
+                dirs.append(od)
+        for d in dirs:
+            p = os.path.join(d, _fname)
+            try:
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(content)
+                return p
+            except Exception as e:
+                print(f"[Watchdog] 写警告文件失败 {p}: {e}")
+        return None
+
     def process_pdf(self, input_path, output_dir, total_pages, scale=2.0,
                     progress_callback=None, vertical_sort=False, overwrite_ocr=False):
         """处理单个PDF文件。output_dir=None时输出到源文件所在目录"""
@@ -1454,9 +1753,8 @@ class PDFProcessor:
             done_pages = [False] * total_pages
             next_to_store = 0
             t0 = time.time()
-            # 看门狗状态（per-consumer，复位周期=每页）
-            _tier1_fired = False  # T1: 重启全部引擎（直接重启所有，不猜轮询映射）
-            _tier2_fired = False  # T2: 触发全文件重启（清空结果、重建引擎、从头跑）
+            # 【2026-10-09】重试计数已改为「每页复位」的局部变量 _page_retry（见下），
+            # 不再需要 per-consumer 的 Tier1/Tier2 标志。
             while my_done < total_pages and not self._cancelled:
                 try:
                     pn, png_bytes = render_queue.get(timeout=0.3)
@@ -1466,45 +1764,56 @@ class PDFProcessor:
                     continue
                 if self._cancelled:
                     break
-                # 每页开始时重置看门狗标志
-                _tier1_fired = False
-                _tier2_fired = False
-                # 看门狗恢复循环：同一页最多重试到 T3（触发全文件重启）
+                # 【2026-10-09 恢复策略（用户定稿）】单页重试计数，每页从 0 开始：
+                #   ① 某页出错/超时 → 重新处理该页，最多 MAX_PAGE_RETRY 次；
+                #   ② 仍卡住        → 触发整份文件重处理（外层循环）；
+                #   ③ 文件也重试用尽 → 跳过该文件 + 写警告文件。
+                _page_retry = 0
                 while True:
                     # 动态超时：取实例0的 get_dynamic_timeout（已聚合所有活跃引擎的耗时）
-                    timeout_sec = self.ocr._instances[0].get_dynamic_timeout()
+                    # 【2026-10-09】force_close 会并发清空 _instances，这里必须防空，
+                    # 否则看门狗自己会抛 IndexError（那是"看门狗被自己弄崩"，不是被锁搞坏）
+                    _insts = getattr(self.ocr, "_instances", None) or []
+                    timeout_sec = _insts[0].get_dynamic_timeout() if _insts else 180
                     t_page = time.time()
                     try:
                         result = self.ocr.ocr_image_png(png_bytes, timeout_seconds=timeout_sec)
                     except Exception as e:
                         result = {"code": 900, "data": f"OCR error: {str(e)}"}
-                    # 检测超时（引擎假死：code=102 + "timeout"）
-                    if result.get("code") == 102 and "timeout" in str(result.get("data", "")).lower():
+                    # 超时判定（引擎假死：code=102 且 data 含 "timeout"）—— 原判定式保留
+                    _is_timeout = (result.get("code") == 102
+                                   and "timeout" in str(result.get("data", "")).lower())
+                    # 本页是否「没有拿到有效结论」：
+                    #   100=引擎给出文字块 / 101=引擎明确回复本页无文字（空白页）→ 有结论
+                    #   102 超时或其它引擎错、900 调用异常 → 没有结论，必须重新处理该页
+                    _page_failed = result.get("code") not in self._RESULT_OK_CODES
+                    if not _page_failed:
+                        break                    # 有结论 → 退出恢复循环，正常入库
+                    if _is_timeout:
                         elapsed = time.time() - t_page
-                        print(f"[Watchdog] Consumer-{consumer_id} Page {pn} timeout after {elapsed:.0f}s (limit={timeout_sec}s)")
-                        if not _tier1_fired:
-                            # Tier 1: 重启全部引擎实例（避免轮询映射错位）
-                            _tier1_fired = True
-                            print(f"[Watchdog] Tier1: restarting ALL engine instances")
+                        print(f"[Watchdog] Consumer-{consumer_id} Page {pn+1} 超时 {elapsed:.0f}s (limit={timeout_sec}s)")
+                    else:
+                        print("[Watchdog] Consumer-%d Page %d 出错 code=%s: %s"
+                              % (consumer_id, pn + 1, result.get("code"),
+                                 str(result.get("data", ""))[:120]))
+                    if _page_retry < self.MAX_PAGE_RETRY:
+                        # ① 重新处理该页（最多 MAX_PAGE_RETRY 次）
+                        _page_retry += 1
+                        print("[Watchdog] → 第 %d/%d 次重新处理第 %d 页"
+                              % (_page_retry, self.MAX_PAGE_RETRY, pn + 1))
+                        if _is_timeout:
+                            # 超时 = 引擎假死，必须重启「全部引擎」才能真正恢复
+                            # （不做单实例重启：两个引擎要么都活着，要么一起重建）
+                            print("[Watchdog] Tier1: restarting ALL engine instances")
                             self.ocr.restart_all()
-                            continue
-                        elif not _tier2_fired:
-                            # Tier 2: 触发全文件重启（引擎重启无效，说明是页面级别问题）
-                            _tier2_fired = True
-                            print(f"[Watchdog] Tier2: all engine restarts failed → full file restart")
-                            self._need_restart = True
-                            self._cancelled = True
-                            self.ocr.force_close()
-                            return
-                        else:
-                            # 不应到达，防御性处理
-                            print(f"[Watchdog] Tier3: unreachable, aborting")
-                            self._need_restart = True
-                            self._cancelled = True
-                            self.ocr.force_close()
-                            return
-                    # 非超时结果（成功 code=100 或 engine error）→ 退出看门狗循环
-                    break
+                        continue
+                    # ② 单页重试用尽 → 触发全文件重处理（外层 for _full_retry 循环）
+                    print("[Watchdog] Tier2: 第 %d 页重试 %d 次仍失败 → 全文件重处理"
+                          % (pn + 1, self.MAX_PAGE_RETRY))
+                    self._need_restart = True
+                    self._cancelled = True
+                    self.ocr.force_close()
+                    return
                 # 正常/超时恢复成功：存结果
                 if not self._need_restart and not self._cancelled:
                     with self.results_lock:
@@ -1530,9 +1839,9 @@ class PDFProcessor:
                         progress_callback(self._total_done, total_pages, next_to_store)
                 else:
                     break
-        # 全文件重启外层循环（最多1次）
+        # 全文件重处理外层循环：首跑 + MAX_FILE_RETRY 次重处理
         self._need_restart = False
-        for _full_retry in range(2):
+        for _full_retry in range(self.MAX_FILE_RETRY + 1):
             num_consumers = 2 if self.dual_instance else 1
             render_queue = Queue(maxsize=20 if num_consumers > 1 else 12)
             # 渲染线程数：渲染能力(20~50页/秒)远大于OCR消化能力(1~4页/秒)，
@@ -1575,14 +1884,35 @@ class PDFProcessor:
                 c.join()
             for t in producers:
                 t.join()
-            if self._need_restart and _full_retry == 0:
+            # 【2026-10-09 完整性闸门】用户要求：宁可整份文件重跑，也绝不交付
+            # 错页 / 漏页 / 乱序的结果。这里是输出前的最后一道校验。
+            # （页序本身是安全的：write_results 用 sorted(results.keys()) 按页码升序写，
+            #   结果也是按页码 pn 存进 dict 的；乱序只可能来自「缺页」，而缺页会被这里拦住。）
+            if not self._cancelled:
+                _bad = self._incomplete_pages(total_pages)
+                if _bad:
+                    _show = "、".join(str(p + 1) for p in _bad[:10])
+                    if len(_bad) > 10:
+                        _show += " …"
+                    print("[Watchdog] 完整性校验未通过：%d/%d 页没有有效结果（页码：%s）"
+                          % (len(_bad), total_pages, _show))
+                    if _full_retry < self.MAX_FILE_RETRY:
+                        print("[Watchdog] → 触发全文件重处理（第 %d/%d 次）"
+                              % (_full_retry + 1, self.MAX_FILE_RETRY))
+                    else:
+                        print("[Watchdog] → 全文件重处理已用尽 → 跳过本文件并生成警告文件")
+                    self._need_restart = True
+            if self._need_restart and _full_retry < self.MAX_FILE_RETRY:
                 print(f"[Watchdog] Full file restart #{_full_retry+1} triggered. Cleaning up...")
                 self._cancelled = True
                 self.ocr.force_close()
                 time.sleep(2)  # 等所有线程感知到 cancelled
                 # 重建引擎
+                # 【2026-10-09 修复】原来是 restart_all()：但上面 force_close() 已经把
+                # _instances 清空，restart_all() 遍历空列表 = 什么都没重建（恢复失效）。
+                # 改用 rebuild()：按记住的构造参数把两个引擎真正重新启动起来。
                 print(f"[Watchdog] Rebuilding all engines for restart...")
-                self.ocr.restart_all()
+                self.ocr.rebuild()
                 self._cancelled = False
                 self.results = {}
                 self.completed_count = 0
@@ -1593,8 +1923,23 @@ class PDFProcessor:
         if self._cancelled and not self._need_restart:
             return None, None
         if self._need_restart:
-            print("[Watchdog] ERROR: Full file restart also failed. Aborting.")
-            return None, None
+            # 【2026-10-09 策略】单页重试 MAX_PAGE_RETRY 次 + 整份文件重处理 MAX_FILE_RETRY 次
+            # 全部用尽仍不行 → 跳过该文件，并在源文件所在文件夹生成一份警告文件。
+            # 既不产出「少了几页却看不出来」的结果文件，也不让用户以为它成功了。
+            # （这里抛异常而不是 return None,None：调用方把 None 显示成「已取消」，
+            #   用户根本看不出是失败；抛异常会走 file_error 信号，日志里明确写出来。）
+            _bad = self._incomplete_pages(total_pages)
+            print("[Watchdog] ERROR: 全文件重处理已用尽（%d/%d 页无有效结果）→ 跳过本文件"
+                  % (len(_bad), total_pages))
+            _notice = self._write_failure_notice(input_path, output_dir, total_pages, _bad)
+            if _notice:
+                print(f"[Watchdog] 已生成警告文件: {_notice}")
+            raise RuntimeError(
+                "本文件处理未完成：%d/%d 页没有有效结果。单页重试 %d 次、整份文件重处理 %d 次"
+                "均已用尽，已跳过本文件。%s"
+                % (len(_bad), total_pages, self.MAX_PAGE_RETRY, self.MAX_FILE_RETRY,
+                   ("已生成警告文件：%s。" % _notice) if _notice
+                   else "（警告文件写入失败，请查看日志。）"))
         return self.write_results(input_path, output_dir, total_pages, scale, vertical_sort=vertical_sort,
                                   overwrite_ocr=overwrite_ocr)
 
@@ -3753,8 +4098,23 @@ class MainWindow(QMainWindow):
     def _show_log_window(self):
         """把启动器的日志窗口调出来 —— 跨进程，用 Win32 按窗口标题查找。
 
-        （日志窗口是独立进程里的 tkinter 窗口，这里只做「显示 + 置顶」，不改它的状态。）
+        日志窗口是独立进程里的 tkinter 窗口，这里只做「显示 + 置顶」，不改它的运行。
+
+        【2026-10-09】日志窗口现在被登记成「本主窗口的从属窗口」，主窗口不可见时
+        它自己也显示不出来；所以先把主界面叫回来（迷你模式下等价于点「恢复」），
+        再调日志窗口，两个才会一起出现在最前面。
         """
+        try:
+            if getattr(self, "_mini_active", False):
+                self.exit_mini_mode()
+            else:
+                self.show()
+                if self.isMinimized():
+                    self.showNormal()
+                self.raise_()
+                self.activateWindow()
+        except Exception:
+            pass
         try:
             import ctypes
             u = ctypes.windll.user32
@@ -4017,6 +4377,93 @@ def _kill_engine_processes(names, dirs=None):
     return killed
 
 
+def _kill_orphan_engines(names=None):
+    """结束「父进程已经消失」的孤儿引擎进程（2026-10-09 卡死修复·之二）。
+
+    为什么需要它：主程序若被强制结束（任务管理器结束任务 / 崩溃 / 断电），
+    它启动的引擎进程不会跟着退出 —— 这些孤儿引擎仍然 LISTEN 着 18043 / 18053。
+    下次启动时新引擎 bind 不上（Windows 允许端口复用），内核会把连接随机分发，
+    于是一半请求打进这个「父进程早已不存在」的僵尸实例：connect 成功、却永远
+    等不到回复 → recv 卡满 180 秒超时 → GPU 占用率归零。
+
+    _kill_engine_processes() 只清「本程序目录内」的引擎，覆盖不到这些孤儿
+    （典型来源：开发目录、旧版本目录、别的安装位置留下的）。
+
+    ★ 判定依据是「父进程是否还存在」，所以**绝不会**误伤另一份正在运行的
+      CathayOCR —— 它的引擎父进程活着，会被直接跳过。C 盘那份不受影响。
+    """
+    if platform.system() != "Windows":
+        return []
+    names_l = {str(n).lower() for n in (names or CLEANUP_TARGETS)}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:
+        return []
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_TERMINATE = 0x0001
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID_HANDLE_VALUE:
+        return []
+
+    alive, targets = set(), []
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(pe))
+        while ok:
+            pid = int(pe.th32ProcessID)
+            alive.add(pid)
+            if pid != os.getpid() and (pe.szExeFile or "").lower() in names_l:
+                targets.append((pid, int(pe.th32ParentProcessID)))
+            ok = kernel32.Process32NextW(snap, ctypes.byref(pe))
+    finally:
+        kernel32.CloseHandle(snap)
+
+    killed = []
+    for pid, ppid in targets:
+        # 父进程仍在 → 一定是另一份正在正常运行的软件，绝不碰（保守起见 PID 复用也算）
+        if ppid in alive and ppid != 0:
+            continue
+        h = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, False, pid)
+        if not h:
+            continue
+        try:
+            if kernel32.TerminateProcess(h, 1):
+                killed.append(pid)
+        finally:
+            kernel32.CloseHandle(h)
+    return killed
+
+
 def _our_engine_dirs():
     """本程序所有引擎可执行文件所在目录（绝对路径）。"""
     dirs = []
@@ -4039,6 +4486,15 @@ if __name__ == '__main__':
     # 启动前清理『本程序目录内』的残余引擎进程
     # 【修复】不再全局按名强杀，避免误伤其它目录正在运行的同类程序
     _kill_engine_processes(CLEANUP_TARGETS)
+    # 【2026-10-09 补】再清一遍「父进程已消失」的孤儿引擎 —— 它们占着 18043/18053
+    # 会让新引擎 bind 不上，请求打进僵尸实例后永远等不到回复（表现为处理卡死、GPU 归零）。
+    # 只按「父进程是否还存在」判定，绝不会误伤另一份正在运行的 CathayOCR。
+    try:
+        _orphans = _kill_orphan_engines()
+        if _orphans:
+            print("[Main] Cleaned up orphan engine pids: %s" % _orphans)
+    except Exception as _e:
+        print("[Main] orphan engine cleanup skipped: %s" % _e)
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     window = MainWindow()
