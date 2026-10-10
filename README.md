@@ -369,7 +369,7 @@ graph TD
 | 版本 | 大小 | 下载 |
 |:--|:--|:--|
 | **① Lite 轻量版** | ~650 MB（.zip） | [⬇️ GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.3.5) · [📦 百度网盘](https://pan.baidu.com/s/13NbKzXrBq1ooR5rc2M-0uQ?pwd=2026)（密码 2026） |
-| **② Pro 专业版** | ~5.0 GB（.7z） | [📦 百度网盘](https://pan.baidu.com/s/13NbKzXrBq1ooR5rc2M-0uQ?pwd=2026)（密码 2026） |
+| **② Pro 专业版** | ~5.0 GB（.7z） | [📦 百度网盘](https://pan.baidu.com/s/1gKLBJKiro8dMKuRJHrqVjg?pwd=2026)（密码 2026） |
 
 > 💡 Lite 轻量版同时上传到 GitHub Releases；Pro 专业版体积较大（~5 GB .7z），仅通过网盘分发。
 
