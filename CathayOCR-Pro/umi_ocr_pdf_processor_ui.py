@@ -1,5 +1,5 @@
 """
-CathayOCR Pro (专业版) v1.3.0 - 多引擎GPU加速PDF处理器
+CathayOCR Pro (专业版) v1.3.5 - 多引擎GPU加速PDF处理器
 Architecture: 预渲染所有页面到RAM -> 单实例OCR流水线 -> 组装输出
 核心思想: GPU永不等待,CPU预渲染消除I/O瓶颈
 =======================================================
@@ -46,8 +46,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog,
     QProgressBar, QGroupBox, QMessageBox, QSpinBox, QComboBox, QCheckBox,
     QRadioButton, QButtonGroup, QListWidget, QListWidgetItem, QTreeView,
-    QTextBrowser, QFrame, QGridLayout, QShortcut,
-    QSystemTrayIcon, QMenu, QAction, QStyle
+    QTextBrowser, QFrame, QGridLayout, QShortcut
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer, QSettings, QEvent
 from PyQt5.QtGui import QFont, QKeySequence, QBrush, QColor, QIcon
@@ -598,6 +597,64 @@ _RESULT_ENGINE_UNAVAILABLE = 103
 # 600/900 之类调用侧异常**不在此列** —— 跟引擎无关，重启只会白等几秒。
 _RESULT_ENGINE_ERROR_CODES = (102, _RESULT_ENGINE_UNAVAILABLE)
 
+
+# ================= 【v1.3.4】空白页引擎核验（事件驱动探针） =================
+# 背景：GPU 驱动发生 TDR（超时重置）后，Vulkan 设备永久失效
+#   （vkQueueSubmit 持续返回 -4 = VK_ERROR_DEVICE_LOST），但引擎**进程还活着**、
+#   端口还在、也照常回话 —— 只是每次都算不出东西，把任何页都报成「无文字」(101)。
+#   光看进程在不在（engines_alive）根本发现不了它，结果就是源源不断的空白壳。
+#
+# 对策：只在「引擎报了 101」时，拿一张它**必然认得出**的白底黑字小图去问它一次：
+#   认得出 → 这台引擎还在干活，那个 101 是真的（本页确实没文字）→ 放行；
+#   认不出 → 这台引擎已经废了 → 判为引擎不可用，交给上层重建。
+# 正常书里没有空白页 → 一次探针都不会发（零常态开销）。
+_PROBE_IMG_B64 = None
+
+
+def _get_probe_image_b64():
+    """生成并缓存一张「引擎必然认得出」的白底黑字小图（base64 PNG）。
+
+    用主程序已有的 PyMuPDF 生成，不引入新依赖；字体用内置 helv（ASCII），
+    内容是最常见的大写字母 + 数字，任何 OCR 模型都认得。
+    """
+    global _PROBE_IMG_B64
+    if _PROBE_IMG_B64 is None:
+        doc = fitz.open()
+        try:
+            page = doc.new_page(width=480, height=120)
+            page.insert_text((32, 78), "OCR TEST 12345",
+                             fontsize=40, fontname="helv", color=(0, 0, 0))
+            pix = page.get_pixmap(dpi=150)
+            _PROBE_IMG_B64 = _b64.b64encode(pix.tobytes("png")).decode("ascii")
+        finally:
+            doc.close()
+    return _PROBE_IMG_B64
+
+
+def _probe_extract_text(data):
+    """从引擎响应里递归提取文字（不用 re，纯字符串处理）。"""
+    parts = []
+
+    def _walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k == "text" and isinstance(v, str):
+                    parts.append(v)
+                else:
+                    _walk(v)
+        elif isinstance(x, (list, tuple)):
+            for it in x:
+                _walk(it)
+        elif isinstance(x, str):
+            parts.append(x)
+
+    try:
+        _walk(data)
+    except Exception:
+        pass
+    return "".join(parts)
+# ================= 【v1.3.4】探针段结束 =================
+
 # 【2026-10-10 修复·之十】连接层瞬时抖动的「透明重发」次数。
 # 线上现象（两份 715 页日志）：请求已发出、引擎一个字节都没回（已收=0B），
 # 连接就在 0.6~0.7 秒被中止（WinError 10053 本机侧 / 10054 引擎侧），
@@ -731,6 +788,32 @@ def get_gpu_devices_for_ui():
     except Exception:
         pass
     return devices
+
+def _img_to_bytes(image):
+    """把「base64 文本」或「原始 PNG bytes」统一成 bytes。
+
+    【2026-10-10 收敛】渲染线程不再做 base64 编码，渲染队列里直接放 PNG 原始
+    bytes —— 每页省掉一次 b64encode（渲染侧）+ 一次 b64decode（消费侧），并让
+    在飞图片内存从约 10.2MB/页降到 7.7MB/页。但探针等旧调用方仍传 base64
+    字符串，所以两种输入都要能接，统一由本函数归一。
+    注意：只做类型归一，不改变任何字节内容。
+    """
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        return bytes(image)
+    return _b64.b64decode(image)
+
+
+def _img_to_b64(image):
+    """把「base64 文本」或「原始 PNG bytes」统一成 base64 文本。
+
+    供「管道协议只认 base64 文本」的引擎（PaddlePipeAdapter）使用：队列若给的是
+    PNG 原始 bytes，就在这里就地编码。与旧行为等价（旧行为是在渲染线程编码），
+    只是把这一编码步骤从渲染侧挪到了消费侧。
+    """
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        return _b64.b64encode(bytes(image)).decode("ascii")
+    return image
+
 
 # ============================================================
 # 引擎适配器抽象基类
@@ -912,6 +995,10 @@ class PaddlePipeAdapter(OCREngineAdapter):
 
     def run_base64(self, image_base64, timeout=180):
         try:
+            # 【2026-10-10 收敛】队列现在传 PNG 原始 bytes；本引擎的管道协议只认
+            # base64 文本，故在此就地编码（等价于原先在渲染线程编码，只是把这
+            # 一步挪到了消费侧 —— 总量与协议均不变）。
+            image_base64 = _img_to_b64(image_base64)
             return self._run_dict({"image_base64": image_base64}, timeout)
         except Exception as e:
             return {"code": 900, "data": f"OCR error: {str(e)}"}
@@ -1079,7 +1166,8 @@ class NcnnCPUAdapter(OCREngineAdapter):
 
     def run_base64(self, image_base64, timeout=180):
         try:
-            img_bytes = _b64.b64decode(image_base64)
+            # 【2026-10-10】入参可能是 base64 文本（探针）或原始 PNG bytes（队列）
+            img_bytes = _img_to_bytes(image_base64)
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
@@ -1105,9 +1193,6 @@ class NcnnCPUAdapter(OCREngineAdapter):
 class NcnnVulkanAdapter(OCREngineAdapter):
     """基于 ncnn Vulkan TCP 服务器的引擎适配器"""
 
-    # 【2026-10-09 卡死修复】同一实例两次重启的最小间隔（秒）
-    _RESTART_MIN_INTERVAL = 8.0
-
     def __init__(self, engine_id, plugin_dir, entry_path):
         super().__init__(engine_id, plugin_dir, entry_path)
         self.config_path = os.path.join(plugin_dir, "config.json")
@@ -1115,24 +1200,12 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         self.port_offset = 0
         self.server_proc = None
         self.lock = threading.Lock()
-        # 【2026-10-09 卡死修复】进程生命周期锁 —— 只保护 server_proc 的「读-改-写」。
-        # 必须与 self.lock 严格分离：self.lock 会被卡在 sock.recv 的线程连续持有
-        # 最多 180 秒，若看门狗重启去抢 self.lock，就会干等 180 秒才动手。
-        # 两把锁绝不嵌套获取（只允许 lock → _proc_lock 这一个方向）。
-        self._proc_lock = threading.Lock()
-        self._last_restart = 0.0
-        self._use_gpu = True  # 实际由 params['use_gpu'] 覆盖
         self.current_config = {}
         self._started = False
+        # 【v1.3.2 修复】进程启停专用锁：绝不复用 self.lock（它会被卡在 recv 的线程持满 180 秒）
+        self._proc_lock = threading.Lock()
+        self._last_restart_ts = 0.0   # 本端口上次重启时刻，用于抑制并发重复重启
         self._ocr_times = collections.deque(maxlen=20)  # 最近OCR耗时(秒)，用于自适应超时
-        # 【2026-10-10 修复·之六】临时 PNG 文件改为「每个线程一份」，绝不再跨线程共用。
-        # 旧实现所有线程共用同一个复用文件：两个 consumer 并发落到同一个 adapter 时，
-        # A 的请求正被引擎读取、B 把同一个文件截断重写 → 引擎读到损坏的 PNG →
-        # 原生崩溃（本机 WER 已禁用，崩溃在系统里不留任何痕迹）→ 连接被 RST →
-        # 日志里成对出现的 TCP error 10053 / 10054。
-        self._tls = threading.local()
-        self._tmp_paths = []
-        self._tmp_paths_lock = threading.Lock()
 
     def set_port_offset(self, offset):
         """设置端口偏移，支持多实例并行"""
@@ -1143,23 +1216,23 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         return self.port + self.port_offset
 
     def _open_stderr_log(self):
-        """把引擎的 stderr 落到「引擎目录/engine_<端口>_stderr.log」（2026-10-10 修复·之五）。
+        """把引擎的 stdout/stderr 落到「引擎目录/engine_<端口>_stderr.log」（v1.3.4）。
 
-        原版用的是 stderr=subprocess.PIPE，但**全程没有任何地方读这个管道**，两个后果：
+        旧实现用 stderr=subprocess.PIPE，但**全程没有任何地方读这个管道**，两个后果：
           ① 引擎往 stderr 写得多了会把管道缓冲区（约 4KB）写满 → 引擎自己阻塞在 write
              上，看起来就是「引擎活着但一直不回复」，极难排查；
           ② 引擎临终前打印的报错被永久留在管道里 —— 它为什么死，程序自己丢掉了。
-             2026-10-10 那份 715 页日志的死因因此查不出来。
         改成落盘后既不会阻塞，事后也能直接翻文件。父进程关闭自己的句柄不影响
         子进程（子进程持有的是继承过去的那份），所以可以先关再读。
+
+        注意：本方法只决定「引擎的话写到哪里」，不改变任何结果码或判定逻辑。
         """
         self._close_stderr_log()
         try:
             path = os.path.join(self.plugin_dir,
                                 "engine_%d_stderr.log" % self._server_port)
-            # 【2026-10-10 修复·之七】改成**追加**：原来每次重启都用 "wb" 截断，
-            # 等于把上一次崩溃前引擎留下的最后几行直接抹掉。本机 WER 已禁用，
-            # 这个文件是唯一的死因线索。超过 512KB 轮转一次，避免无限增长。
+            # 追加写：每次重启都截断的话，会把上一次崩溃前引擎留下的最后几行抹掉。
+            # 超过 512KB 轮转一次，避免无限增长。
             try:
                 if os.path.exists(path) and os.path.getsize(path) > 512 * 1024:
                     os.replace(path, path + ".1")
@@ -1182,10 +1255,9 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                 pass
 
     def _note_stderr(self, text):
-        """往引擎日志里插一行「本程序视角」的记录（2026-10-10 修复·之七）。
+        """往引擎日志里插一行「本程序视角」的记录。
 
-        引擎若是原生崩溃，它自己不会留下任何遗言（本机 WER 已禁用，
-        系统事件日志 / WER 归档里一条都查不到）。所以退出码、重启原因这些
+        引擎若是原生崩溃，它自己不会留下任何遗言，所以退出码、重启原因这些
         关键事实必须由我们写进同一个文件，否则事后无从判断「是崩了还是被杀」。
         """
         fh = getattr(self, "_stderr_fh", None)
@@ -1213,7 +1285,6 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         self.stop()
         self.current_config = params
         use_gpu = params.get("use_gpu", True)
-        self._use_gpu = use_gpu  # 【2026-10-09】供 restart() 判断该重启哪一种启动方式
         try:
             config = self._build_config(params)
             # 多实例配置隔离：不同端口用不同config文件
@@ -1239,8 +1310,7 @@ class NcnnVulkanAdapter(OCREngineAdapter):
             self.server_proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.DEVNULL,
-                # 【2026-10-10 修复·之七】stdout 也一起落盘（原来 DEVNULL 丢掉了）。
-                # 两个流写同一个**文件**（不是管道），不会阻塞。
+                # 【v1.3.4】引擎的 stdout/stderr 落到文件（不是无人读的管道）。
                 stdout=(self._stderr_fh if self._stderr_fh is not None
                         else subprocess.DEVNULL),
                 stderr=(self._stderr_fh if self._stderr_fh is not None
@@ -1345,7 +1415,6 @@ class NcnnVulkanAdapter(OCREngineAdapter):
                 "gpu_device_index": gpu_device
             }
         }
-
     def _server_running(self):
         try:
             with socket.create_connection(("127.0.0.1", self._server_port), timeout=1):
@@ -1356,84 +1425,43 @@ class NcnnVulkanAdapter(OCREngineAdapter):
     def _tcp_request(self, request, timeout=180):
         with self.lock:
             if not self._ensure_running():
-                # 【2026-10-10 修复·之一】原版这里返回的是
-                #     {"code": 102, "data": "OCR timeout (engine unavailable)"}
-                # —— 塞进 "timeout" 关键字纯粹是为了蹭看门狗那条
-                # 「code=102 且 data 含 timeout」的判定，好让它触发 Tier1。
-                # 代价是「引擎不可用」和「真·180 秒超时」从此不可区分：
-                # 日志上打出「超时 1s (limit=180s)」，用户根本没法判断到底发生了什么。
-                # 现在改用独立结果码 103，语义明确，也不再需要蹭关键字。
+                # 【v1.3.2 修复·之二】引擎不可用改用独立结果码 103。
+                # 旧写法是 {"code": 102, "data": "...timeout..."} —— 靠硬塞 "timeout"
+                # 关键字去蹭看门狗那条判定，代价是「引擎不可用（约 1 秒返回）」和
+                # 「真·180 秒超时」永远分不开（日志里会出现「超时 1s (limit=180s)」
+                # 这种自相矛盾的记录）。而 v1.3.1 的消费端本来就是按 103 写的，
+                # 于是那条恢复分支实际上是死的。现在两边语义对齐。
+                # 注：self.lock 仍然照 v1.2.4 包住整段请求 —— 它只对本实例的并发
+                #     请求起串行保护，不是「卡住」的成因，不予改动。
                 return {"code": _RESULT_ENGINE_UNAVAILABLE,
                         "data": "OCR engine unavailable (port %d not answering)"
                                 % self._server_port}
-            # 【2026-10-10 修复·之九】把 TCP 错误细分到「发生阶段」并记录耗时与异常类型。
-            # 原来 connect / send / recv 三段共用一个 except，日志只剩
-            #     "TCP error: [WinError 10053] ..."
-            # —— 看不出断在哪一步、断了多久、什么异常，用户为此连着追问
-            #    「引擎层故障到底是怎么回事」。补齐这三项后，下次再出现即可直接定性：
-            #     阶段=connect  → 引擎监听 / accept 出问题（引擎侧）
-            #     阶段=send     → 连接刚建成即被中止（本机栈 / 安全软件）
-            #     阶段=recv，耗时很短   → 引擎处理中主动关掉了连接
-            #     阶段=recv，耗时≈timeout → 超时边界
-            # 注意辨别：WinError 10053「你的主机中的软件中止了一个已建立的连接」
-            #   是**本机**一侧被中止（WSAECONNABORTED）；对端强行关闭是 10054
-            #   「远程主机强迫关闭了一个现有的连接」（WSAECONNRESET）。两者别混。
-            _err = "no response"
-            # 【2026-10-10 修复·之十】透明重发循环 —— 判据与理由见 _TCP_TX_RETRY 的注释。
-            for _tx in range(_TCP_TX_RETRY + 1):
-                _t_stage = "connect"
-                _t_beg = time.time()
-                _t_recv = 0
-                try:
-                    with socket.create_connection(("127.0.0.1", self._server_port), timeout=timeout) as sock:
-                        sock.settimeout(timeout)
-                        _t_stage = "send"
-                        json_str = json.dumps(request)
-                        sock.sendall(json_str.encode("utf-8"))
-                        _t_stage = "recv"
-                        chunks = []
-                        while True:
-                            try:
-                                chunk = sock.recv(4096)
-                            except socket.timeout:
-                                return {"code": 102, "data": f"OCR timeout ({timeout}s)"}
-                            if not chunk:
-                                break
-                            chunks.append(chunk)
-                            _t_recv += len(chunk)
-                        _t_stage = "parse"
-                        text = b"".join(chunks).decode("utf-8", errors="ignore")
-                        return self._parse_json(text)
-                except Exception as e:
-                    _err = ("TCP error: %s [阶段=%s 耗时%.2fs 已收=%dB 类型=%s]"
-                            % (e, _t_stage, time.time() - _t_beg,
-                               _t_recv, type(e).__name__))
-                    # 只对「连接层瞬时抖动」透明重发：异常在收发阶段 + 一个字节都没收到。
-                    # 其余情况（解析失败 / 真超时 / 引擎报错）一律原样返回，绝不掩盖真问题。
-                    if _tx >= _TCP_TX_RETRY or _t_stage != "recv" or _t_recv != 0:
-                        return {"code": 102, "data": _err}
-                    print("[NcnnAdapter] 端口 %d 连接在 %s 阶段被中止（响应 0 字节，"
-                          "引擎未处理本页）→ 透明重发 %d/%d"
-                          % (self._server_port, _t_stage, _tx + 1, _TCP_TX_RETRY))
-                    time.sleep(0.03)
-            return {"code": 102, "data": _err}
+            try:
+                with socket.create_connection(("127.0.0.1", self._server_port), timeout=timeout) as sock:
+                    sock.settimeout(timeout)
+                    json_str = json.dumps(request)
+                    sock.sendall(json_str.encode("utf-8"))
+                    chunks = []
+                    while True:
+                        try:
+                            chunk = sock.recv(4096)
+                        except socket.timeout:
+                            return {"code": 102, "data": f"OCR timeout ({timeout}s)"}
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    text = b"".join(chunks).decode("utf-8", errors="ignore")
+                    return self._parse_json(text)
+            except Exception as e:
+                return {"code": 102, "data": f"TCP error: {str(e)}"}
 
     def _engine_is_ours(self):
-        """端口上有响应时，判断响应者是否确为「本对象启动、且仍存活」的那个引擎。
+        """端口上有响应时，判断响应者是否确为「本对象启动、且仍存活」的引擎。
 
-        只连得通是不够的：上一次会话被强杀后留下的孤儿引擎（或别的目录里的同类引擎）
-        会把端口占住 —— 内核替它把连接 SYN 收下（connect 成功），请求却永远等不到
-        回复（recv 一直挂到 180 秒超时，GPU 占用率掉到 0）。那种情况下
-        self.server_proc 要么为空、要么早已退出，据此即可判定「响应者不是我们的」。
-
-        【2026-10-10 修复·之二】判定依据从「self._started 且进程活着」改成
-        「只看进程句柄」——因为 self._started 会被 _ensure_running() 第 3 步
-        在端口探测失败时**无条件**打掉，而端口探测的超时只有 1 秒、引擎忙时必然
-        失败。于是原先的保护逻辑自我拆台：
-            一次探测失败 → _started=False → _engine_is_ours() 恒为 False
-            → 该实例此后每次请求都在 1 秒内返回「引擎不可用」→ 且永不重启
-            （_ensure_running 按设计不重启）→ 看门狗误当超时 → 整份文件报废。
-        进程句柄才是「归属」的唯一可信依据：server_proc 只由本对象的 Popen 赋值。
+        【v1.3.2 修复·之一】只认进程句柄 —— server_proc 只由本对象的 Popen 赋值，
+        是「归属」唯一可信的依据。只连得通不算数：上次被强杀留下的孤儿引擎也会把
+        端口占住，内核替它收下 SYN（connect 成功），请求却永远等不到回复
+        （recv 挂满 180 秒，GPU 占用率归零）。
         """
         p = self.server_proc
         try:
@@ -1441,99 +1469,43 @@ class NcnnVulkanAdapter(OCREngineAdapter):
         except Exception:
             return False
 
-    def _kill_proc(self, proc):
-        """结束「传入的」进程对象（2026-10-09 卡死修复）。
-
-        关键点：以参数为准，而不是读 self.server_proc。
-        调用方一律先抢引用（old = self.server_proc; self.server_proc = None）
-        再调用本方法 —— 这样即使多个线程并发重启，每个线程只杀自己抢到的那个，
-        不会互相覆盖引用，更不会把别人刚建好的进程变成无人回收的孤儿。"""
-        if proc is None:
-            return
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    proc.kill()
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-
-    def kill_now(self):
-        """立即结束引擎进程（供 force_close / 进程清理使用，2026-10-09 新增）。
-
-        刻意 **不加** self._proc_lock：它的意义就是尽快打断正阻塞在 recv 上的调用，
-        加锁反而可能被另一条重启路径挡住。「抢引用 + 杀对象」的写法本身已避免孤儿。"""
-        old = self.server_proc
-        self.server_proc = None
-        self._started = False
-        self._close_stderr_log()
-        self._kill_proc(old)
-
     def _ensure_running(self):
-        """只做「引擎是否可用」的**检查**，绝不在本方法里自行重启（2026-10-09 修复）。
+        """只做「引擎是否可用」的**检查**，**绝不在这里起新进程**。
 
-        为什么改成「只检查、不重启」：
-        本软件是双实例「轮询分页」——不同页发给不同引擎，共用一个递增计数器
-        (_adapter_index)。如果这里只重启「自己这一个」，两个引擎就会进入
-        「一新一旧 / 一好一坏」的不一致状态；用户明确要求：宁可两个一起重启，
-        也不要留半个坏引擎在旁边。
-
-        于是统一语义：
-            引擎不可用 → 本页立即失败返回（code=103，见 _RESULT_ENGINE_UNAVAILABLE）
-                      → 看门狗判定「引擎确实坏了」→ Tier1 触发 restart_all()
-                      → **两个实例一起重启** → 同一页重发 → 恢复。
-        注意（2026-10-10 修复·之六）：只有「103 不可用 / 引擎进程已退出 / 真超时」
-        才走 Tier1。单纯一条连接被 RST（TCP error 10053 / 10054）而进程还活着时，
-        那只是「这一页没拿到结果」，原地重发即可 —— 若也去 restart_all()，
-        会把另一个本来健康的引擎一起杀掉，连带另一个 consumer 的在途请求也断。
-
-        附带好处：恢复了「本方法永不 Popen 新进程」这一性质。旧实现直接
-        self.start()，而 start() 里 stop() 只按 self.server_proc 杀一个 —— 并发下
-        引用会被覆盖，留下孤儿引擎（实测两个进程同时 LISTEN 同一端口）。
-
-        另一处必须保留的判定：_server_running() 的探测超时只有 1 秒，引擎忙时
-        会误判「已死」。所以**先看进程是否还活着**（_engine_is_ours），活着就一律
-        视为可用 —— 否则大文件跑到一半会被误判、把两个引擎都重启掉。
+        【v1.3.2 修复·之一】v1.2.4 的写法是「1 秒探活失败 → 直接再启动一个引擎」。
+        但探活超时只有 1 秒，引擎忙时必然失败；此时旧进程还在跑，
+        再启动会把它的引用覆盖掉 —— 旧进程从此没人管，变成霸占端口的孤儿
+        （实测日志里同一端口被连续启动两次 = 就是它）。之后请求随机打进僵尸、
+        recv 卡满 180 秒、看门狗重启、再生孤儿 = 周期性「卡住」。
+        现在这里一个进程都不建，重建统一交给看门狗 restart_all()。
         """
-        # 1) 我们自己的引擎进程还活着 → 可用。探测超时只是「忙」，不能据此判死。
+        # 1) 我们自己的引擎进程还活着 → 可用（1 秒探活失败只代表「忙」，不能据此判死）
         if self._engine_is_ours():
             return True
-        # 2) 进程不在，但端口有人响应 → 响应者是「不是我们启动的」占位引擎
+        # 2) 进程不在，但端口有人响应 → 那是孤儿 / 别处的同类程序，清掉占位者
         if self._server_running():
             with self._proc_lock:
-                if self._engine_is_ours():          # 可能别的线程刚修好
+                if self._engine_is_ours():      # 可能别的线程刚修好
                     return True
                 print("[NcnnAdapter] 端口 %d 被非本进程启动的引擎占用 → 清理占位者"
                       % self._server_port)
-                dropped = _kill_orphan_engines()
-                if dropped:
-                    print("[NcnnAdapter] 已清理孤儿引擎: %s" % dropped)
                 old = self.server_proc
                 self.server_proc = None
                 self._started = False
-                self._kill_proc(old)
+                try:
+                    if old is not None and old.poll() is None:
+                        old.kill()
+                except Exception:
+                    pass
+                try:
+                    _kill_orphan_engines()
+                except Exception:
+                    pass
             return False
-        # 3) 进程已死 / 从未起来 → 清掉悬空引用（不在这里重启，交给看门狗）。
-        # 【2026-10-10 修复·之二】到这里时进程**确实**已经不在（步骤 1 已经用
-        #   进程句柄判定过：活着就直接 return True 了），所以置 _started = False
-        #   是对的。但要注意 _started 从此不再是归属的判定依据
-        #   —— 见 _engine_is_ours() 的注释（旧版无条件打掉它，把活着的引擎判死）。
+        # 3) 进程已死 / 从未起来 → 清掉悬空引用（不在这里重启）
         with self._proc_lock:
             old = self.server_proc
             if old is not None and old.poll() is not None:
-                # 【2026-10-10 修复·之七】把退出码写进引擎日志：本机 WER 已禁用，
-                # 引擎若是原生崩溃（0xC0000005 等），系统里查不到任何痕迹，
-                # 只有这个 returncode 能证明「它是自己崩了，还是被我们杀掉的」。
-                _rc = old.returncode
-                print("[NcnnAdapter] 端口 %d 的引擎进程已退出，returncode=%s"
-                      % (self._server_port, _rc))
-                self._note_stderr("engine exited: returncode=%s"
-                                  " (0xC0000005=访问违例崩溃, 15/1=被终止)" % _rc)
                 self.server_proc = None
             self._started = False
         return False
@@ -1568,7 +1540,8 @@ class NcnnVulkanAdapter(OCREngineAdapter):
 
     def run_base64(self, image_base64, timeout=180):
         try:
-            img_bytes = _b64.b64decode(image_base64)
+            # 【2026-10-10】入参可能是 base64 文本（探针）或原始 PNG bytes（队列）
+            img_bytes = _img_to_bytes(image_base64)
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 tmp.write(img_bytes)
                 tmp_path = tmp.name
@@ -1629,53 +1602,33 @@ class NcnnVulkanAdapter(OCREngineAdapter):
             return floor
         return int(min(upgrade, ceiling))
 
-    def restart(self, params=None):
-        """强制重启引擎进程（看门狗 Tier1 恢复路径）。
+    _RESTART_MIN_INTERVAL = 8.0   # 同一端口两次重启的最小间隔（秒）
 
-        【2026-10-09 卡死修复】加 _proc_lock 串行化 + 8 秒抑制窗口 + 抢占引用：
-        - 原来每个 consumer 线程各跑一份看门狗、都能并发进 restart()，
-          两个线程同时 stop()+start() 会让 self.server_proc 引用互相覆盖，
-          留下没人管的孤儿进程（实测同一端口被两个引擎同时 LISTEN）；
-        - 否则两个 consumer 各触发一次 Tier1，会把同一引擎白白重启两遍。
-        看门狗的触发条件 / Tier 层级 / 重试次数一律未改，只改「重启时怎么记账」。
+    def restart(self, params=None):
+        """强制重启引擎进程（杀旧进程 → 重建新进程）
+        用于从 Vulkan 假死中恢复，不改变 config。
+
+        【v1.3.2 修复·之三】加 `_proc_lock` + 8 秒抑制窗：
+        两个 consumer 常常同时判定超时、同时调 restart_all() —— 实测日志里同一个
+        端口会被连续启动两次（第二次 bind 不上，反倒留下新的占位者）。
+        这里用「进程启停专用锁」把重启串行化；若本端口刚重启过、且新引擎确实活着，
+        就直接跳过这次重复重启。
+        注意：绝不复用 self.lock —— 它会被卡在 recv 的线程持满 180 秒。
         """
         with self._proc_lock:
-            if (self._server_running() and self._engine_is_ours()
-                    and time.time() - self._last_restart < self._RESTART_MIN_INTERVAL):
-                # 另一个线程刚重启过、且**我们自己的**服务确实已恢复 → 直接复用。
-                # （必须带 _engine_is_ours：若端口被孤儿占着，不能算「已恢复」。）
+            _now = time.time()
+            _last = getattr(self, "_last_restart_ts", 0.0)
+            if self._engine_is_ours() and (_now - _last) < self._RESTART_MIN_INTERVAL:
+                print("[NcnnAdapter] 端口 %d 刚重启过（%.1fs 内）→ 跳过重复重启"
+                      % (self._server_port, _now - _last))
                 return ""
+            self._last_restart_ts = _now
             print(f"[NcnnAdapter] Restarting engine on port {self._server_port}...")
-            old = self.server_proc
-            if old is not None and old.poll() is not None:
-                # 【2026-10-10 修复·之七】引擎在我们重启它之前就已经死了 ——
-                # 记下退出码（0xC0000005=访问违例崩溃 / 15、1=被终止 / 0=正常退出）。
-                # 本机 WER 已禁用，这是唯一能区分「崩了」还是「被杀」的痕迹。
-                print("[NcnnAdapter] 端口 %d 的引擎已先退出，returncode=%s"
-                      % (self._server_port, old.returncode))
-                self._note_stderr("engine already exited before restart:"
-                                  " returncode=%s" % old.returncode)
-            self.server_proc = None
-            self._started = False
-            self._close_stderr_log()
-            self._kill_proc(old)
+            self.stop()
             time.sleep(0.5)  # 等操作系统释放端口
-            # 【2026-10-09 修复】端口仍被「不是我们启动的」引擎占着（孤儿/别目录引擎）
-            # → 先清掉占位者。否则 start() 里 _server_running() 会假性通过、
-            #   _started 被置 True 看起来"重启成功"，实际请求全打进僵尸实例。
-            if self._server_running() and not self._engine_is_ours():
-                dropped = _kill_orphan_engines()
-                if dropped:
-                    print("[NcnnAdapter] 重启前清理孤儿引擎: %s" % dropped)
-                time.sleep(0.2)
             if params is None:
                 params = self.current_config
-            try:
-                err = self.start(params)
-            except Exception as e:
-                err = f"[Error] Engine restart failed: {str(e)}"
-            self._last_restart = time.time()
-            return err
+            return self.start(params)
 
     def close(self):
         self.stop()
@@ -1714,15 +1667,11 @@ def build_engine_params(engine_id, use_gpu, vertical_text, limit_side_len,
     if engine_id == "easyocr_universal":
         # EasyOCR passes language as command-line argument
         params["language"] = extra_params.get("easyocr_lang", "en")
+        # Also pass gpu flag
+        params["use_gpu"] = extra_params.get("use_gpu", False)
 
     if einfo["entry_type"] == "pipe":
         params["use_gpu"] = use_gpu
-        if engine_id == "easyocr_universal":
-            # EasyOCR 仅 CPU：本包内置 torch 是 CPU 版
-            # （实测 torch 2.13.0+cpu、torch.version.cuda=None、cuda.is_available()=False、device_count=0），
-            # 即便传 --use_gpu=True 也会被 torch 静默忽略而回退 CPU。
-            # 这里显式锁 False，杜绝「界面上像是用了GPU、实际在跑CPU」的假象。
-            params["use_gpu"] = False
         params["limit_side_len"] = limit_side_len
         params["cls"] = use_angle_cls
         if engine_id.startswith("umi_plugin_v6"):
@@ -1737,25 +1686,26 @@ def build_engine_params(engine_id, use_gpu, vertical_text, limit_side_len,
             params["blank_page_strategy"] = "skip"
             params["rec_batch_num"] = extra_params.get("rec_batch_num", 12 if use_gpu else 6)
             params["shrink_poly_ratio"] = extra_params.get("shrink_poly_ratio", 0.0)
-            # CUDA 设备号（服务端 --gpu_device，默认 0；CPU 模式下服务端会忽略）
-            params["gpu_device"] = extra_params.get("gpu_device", 0)
         elif engine_id == "win7_v5":
             params["enable_mkldnn"] = True
             params["cpu_threads"] = extra_params.get("cpu_threads", 4)
             # 按 lang 路由到对应文字系统的 config（各 config 指向官方分语种 rec 模型）
             # 阿拉伯/天城文/泰/希腊/泰卢固/泰米尔 + 韩文 + 西里尔(eslav/cyrillic) + 拉丁(latin)
             # 中/英/日及未列出语种回退 config_universal.txt（v5 server 模型）
+            # 【v1.3.5 修复】本表在 v1.3.1「引擎链路还原成老版行为」时被一并回退掉，
+            #   导致 win7_v5 恒加载 config_universal.txt（中文 6623 字字典、仅含 6 个
+            #   西里尔字符）→ 韩/俄/阿/天城/泰等必乱码。此处照 v1.3.0 定稿原样补回。
             lang_v5 = extra_params.get("lang", "") or ""
             _v5_lang_config = {
-                # 阿拉伯字母系（含新补：普什图/信德/克什米尔/俾路支）
+                # 阿拉伯字母系（含：普什图/信德/克什米尔/俾路支）
                 "ar": "arabic", "fa": "arabic", "ug": "arabic", "ur": "arabic",
                 "ps": "arabic", "sd": "arabic", "ks": "arabic", "bal": "arabic",
-                # 天城文系（含新补：博杰普尔/迈蒂利/孔卡尼）
+                # 天城文系（含：博杰普尔/迈蒂利/孔卡尼）
                 "hi": "devanagari", "mr": "devanagari", "ne": "devanagari", "sa": "devanagari",
                 "bh": "devanagari", "mai": "devanagari", "kok": "devanagari",
                 # 单文字系
                 "th": "th", "el": "el", "te": "te", "ta": "ta",
-                # 韩文（官方 v5 专用模型，准确率 88%）
+                # 韩文（官方 v5 专用模型）
                 "korean": "korean",
                 # 东斯拉夫（俄/白俄/乌克兰）
                 "ru": "eslav", "uk": "eslav", "be": "eslav",
@@ -1821,6 +1771,7 @@ def build_engine_params(engine_id, use_gpu, vertical_text, limit_side_len,
 # OCR Client - Multi-Engine Singleton
 # ============================================================
 
+
 class OCRClient:
     """多引擎OCR客户端 - 单例模式
     支持双实例并行OCR（dual_instance=True时启动两个独立引擎进程），
@@ -1852,13 +1803,14 @@ class OCRClient:
         self._gpu_device = gpu_device
         self._dual_instance = dual_instance
         self._adapter_index = 0
-        # 【2026-10-10 修复·之六】派发计数器必须原子自增：两个 consumer 并发
-        # 读-改-写 _adapter_index 会算出同一个 idx，把两页同时送进同一个引擎。
-        self._dispatch_lock = threading.Lock()
+        # 【v1.3.3 修复】取号与自增必须原子化：否则两个 consumer 会同时读到
+        # 同一个值 → 选中同一个引擎实例 → 该实例的临时图被两条线程同时读写。
+        self._pick_lock = threading.Lock()
+        # 【v1.3.4】空白页核验专用锁：串行化探针，绝不复用会被 recv 卡满
+        # 180 秒的 self.lock（那会把看门狗一起锁死）。
+        self._probe_lock = threading.Lock()
         self._instances = []
-        # 【2026-10-09】记住构造参数：Tier2 全文件重启时要用它把引擎**真正**重建起来
-        # （见 rebuild()）。旧实现重建时直接 restart_all()，但那时 _instances 已被
-        # force_close() 清空 —— 等于什么都没重建，恢复流程形同虚设。
+        # 【2026-10-10】记住构造参数：Tier2 全文件重启(rebuild)用它真正重建引擎
         self._ctor = {
             "engine_id": engine_id, "use_gpu": use_gpu,
             "vertical_text": vertical_text, "limit_side_len": limit_side_len,
@@ -1881,20 +1833,69 @@ class OCRClient:
                     a.close()
                 raise RuntimeError(f"引擎实例{i+1}启动失败: {err}")
             self._instances.append(adapter)
-            print(f"[OCRClient] 实例{i+1}就绪: {engine_display_name(engine_id)} | GPU={use_gpu} | 边长={limit_side_len} | 模型={model_size}")
+            print(f"[OCRClient] 实例{i+1}就绪: {engine_id} | GPU={use_gpu} | 边长={limit_side_len} | 模型={model_size}")
         self.adapter = self._instances[0]
         self._initialized = True
-
     def ocr_image_base64(self, image_base64, timeout_seconds=180):
-        """轮询调度多个实例"""
+        """轮询调度多个实例。
+
+        【2026-10-10 收敛】参数 image_base64 现在既可能是 base64 文本（探针），
+        也可能是原始 PNG bytes（渲染队列已不再做 base64 编码）。两种输入都由
+        底层 adapter 统一归一，调用方无需关心。方法名保留不变，以免牵动所有
+        调用点。
+        """
         if self._dual_instance and len(self._instances) > 0:
-            # 【2026-10-10 修复·之六】原子派发，见 __init__ 里的 _dispatch_lock
-            with self._dispatch_lock:
+            # 【v1.3.3 修复】取号+自增在同一把锁内，保证两个 consumer 不会
+            # 选中同一个引擎实例（撞上就会并发读写同一份临时图）。
+            with self._pick_lock:
                 idx = self._adapter_index % len(self._instances)
                 self._adapter_index += 1
-            return self._instances[idx].run_base64(image_base64, timeout_seconds)
-        return self._instances[0].run_base64(image_base64, timeout_seconds)
+            result = self._instances[idx].run_base64(image_base64, timeout_seconds)
+            # 【v1.3.4】引擎报「本页无文字」时，核实**这一台**引擎是否还在干活
+            # （GPU 驱动 TDR 后它会把任何页都报成无文字）。只探本次轮询分到的
+            # 那一台，不去打扰另一台正在处理的页。
+            if result.get("code") == 101 and not self._probe_instance(idx):
+                return {"code": _RESULT_ENGINE_UNAVAILABLE,
+                        "data": "OCR engine dead (blank-page probe failed on instance %d)"
+                                % (idx + 1)}
+            return result
+        result = self._instances[0].run_base64(image_base64, timeout_seconds)
+        if result.get("code") == 101 and not self._probe_instance(0):
+            return {"code": _RESULT_ENGINE_UNAVAILABLE,
+                    "data": "OCR engine dead (blank-page probe failed on instance 1)"}
+        return result
 
+    def _probe_instance(self, idx, timeout=45):
+        """用一张必认得的图核实某个引擎实例是否还能干活（True=健康）。
+
+        【v1.3.4】GPU 驱动 TDR 之后引擎会「活着但永久算不出」，把任何页都报成
+        无文字。这里用白底黑字小图去问它：认得出文字 = 还在干活；认不出 = 已废。
+        探针自身异常/超时一律返回 False（宁可多跑一遍，也绝不交付空白壳）。
+        用专用的 _probe_lock 串行化探针 —— 绝不复用会被 recv 卡满 180 秒的
+        self.lock（那会把看门狗一起锁死）。
+        """
+        insts = getattr(self, "_instances", None) or []
+        if idx < 0 or idx >= len(insts):
+            return True            # 没有对应实例 → 无法判定，不据此判废
+        lock = getattr(self, "_probe_lock", None)
+        try:
+            if lock is None:
+                lock = threading.Lock()
+                self._probe_lock = lock
+            with lock:
+                img_b64 = _get_probe_image_b64()
+                # 连续两次都认不出才判废：滤掉「某一次恰好没认出」的偶发情况，
+                # 避免把健康引擎误判成废的（误判会导致每页都触发重建）。
+                for _attempt in (1, 2):
+                    result = insts[idx].run_base64(img_b64, timeout)
+                    if (result.get("code") == 100
+                            and len(_probe_extract_text(result.get("data")).strip()) >= 1):
+                        return True
+                    if _attempt == 1:
+                        time.sleep(0.4)
+            return False
+        except Exception:
+            return False
     def engines_alive(self):
         """所有实例的引擎进程是否都还活着（2026-10-10 修复·之六）。
 
@@ -1924,15 +1925,9 @@ class OCRClient:
 
     def force_close(self):
         """强制关闭：直接 kill 子进程，立即中断阻塞的 OCR 调用"""
-        # 【2026-10-09 修复】优先用 kill_now()（抢引用后杀），避免与看门狗重启撞车时
-        # 把引用覆盖、留下孤儿；先做快照防并发遍历出错。其它引擎类型（Paddle / ncnn CPU）
-        # 没有 kill_now，回退到原来的直接 kill。
-        for a in list(getattr(self, "_instances", [])):
+        for a in getattr(self, "_instances", []):
             try:
-                kn = getattr(a, "kill_now", None)
-                if callable(kn):
-                    kn()
-                elif hasattr(a, 'server_proc') and a.server_proc:
+                if hasattr(a, 'server_proc') and a.server_proc:
                     a.server_proc.kill()
                 elif hasattr(a, 'pipe') and a.pipe:
                     a.pipe.kill()
@@ -1940,28 +1935,22 @@ class OCRClient:
                 pass
         self._instances = []
         self._initialized = False
-
     def restart_single(self, instance_idx):
-        """【2026-10-09 语义统一】保留本方法只为兼容旧调用，**不再真的只重启一个**。
-
-        双实例是轮询分页，只重启其中一个会让两个引擎处于「一新一旧」的不一致状态；
-        用户明确要求「宁可两个一起重启」。所以这里直接转成 restart_all()。
-        （说明：本方法在当前代码里没有任何调用方，看门狗走的本来就是 restart_all。）
-        """
-        print("[OCRClient] restart_single → 统一改为重启全部实例")
-        self.restart_all()
-
+        """重启单个引擎实例（Tier1恢复）"""
+        instances = getattr(self, "_instances", [])
+        if instance_idx < len(instances):
+            try:
+                instances[instance_idx].restart()
+            except Exception as e:
+                print(f"[OCRClient] restart_single({instance_idx}) failed: {e}")
     def restart_all(self):
-        """重启全部引擎实例（看门狗 Tier1；也是本程序唯一的引擎恢复路径）"""
-        # 【2026-10-09 修复】先做快照：force_close() 可能并发把 _instances 清空，
-        # 直接遍历原列表会漏掉中途新建的实例。实例内部的并发由各自的 _proc_lock 兜住。
-        instances = list(getattr(self, "_instances", []))
+        """重启全部引擎实例（Tier2恢复）"""
+        instances = getattr(self, "_instances", [])
         for i, a in enumerate(instances):
             try:
                 a.restart()
             except Exception as e:
                 print(f"[OCRClient] restart_all[{i}] failed: {e}")
-
     def rebuild(self):
         """按原构造参数**真正重建**全部引擎实例（Tier2 全文件重启专用）。
 
@@ -2032,6 +2021,7 @@ class OCRClient:
 # ============================================================
 # PDF Processor - Pre-render Pipeline
 # ============================================================
+
 
 class PDFProcessor:
     def __init__(self, ocr_client, dual_instance=True):
@@ -2234,6 +2224,11 @@ class PDFProcessor:
         all_done = threading.Event()
         _render_done_count = [0]
         _render_done_lock = threading.Lock()
+        # 【2026-10-10 · 日志收敛】本册「连接瞬时中断」次数：两个 OCR 消费者线程
+        # 共同累加（故加锁）。逐页不再打印——那是引擎 TCP 层的一次抖动，引擎进程
+        # 全程存活、无需用户操心，刷屏反而会被误读成故障；只在文件处理结束时汇总一行。
+        _tcp_jitter = [0]
+        _tcp_jitter_lock = threading.Lock()
         def render_worker(start_page, end_page):
             for pn in range(start_page, end_page):
                 if self._cancelled:
@@ -2243,10 +2238,11 @@ class PDFProcessor:
                     return
                 try:
                     png_bytes = self.render_page_to_bytes(input_path, pn, scale)
-                    b64_data = _b64.b64encode(png_bytes).decode("ascii")
+                    # 【2026-10-10 收敛】队列直接携带 PNG bytes：不再 base64 编码，
+                    # 消费端也就无需解码（每页省一次 encode + 一次 decode）。
                     while not self._cancelled:
                         try:
-                            render_queue.put((pn, b64_data), timeout=1)
+                            render_queue.put((pn, png_bytes), timeout=1)
                             break
                         except Full:
                             continue
@@ -2265,7 +2261,7 @@ class PDFProcessor:
             # 不再需要 per-consumer 的 Tier1/Tier2 标志。
             while my_done < total_pages and not self._cancelled and not self._user_cancelled:
                 try:
-                    pn, b64_data = render_queue.get(timeout=0.3)
+                    pn, img_data = render_queue.get(timeout=0.3)
                 except Empty:
                     if all_done.is_set():
                         break
@@ -2295,7 +2291,7 @@ class PDFProcessor:
                     timeout_sec = _gdt() if callable(_gdt) else 180
                     t_page = time.time()
                     try:
-                        result = self.ocr.ocr_image_base64(b64_data, timeout_seconds=timeout_sec)
+                        result = self.ocr.ocr_image_base64(img_data, timeout_seconds=timeout_sec)
                     except Exception as e:
                         result = {"code": 900, "data": f"OCR error: {str(e)}"}
                     # 超时判定（引擎假死：code=102 且 data 含 "timeout"）—— 原判定式保留
@@ -2335,56 +2331,50 @@ class PDFProcessor:
                     if self._user_cancelled:
                         return
                     if _is_unavailable:
-                        print("[Watchdog] Consumer-%d Page %d 引擎不可用"
-                              "（约 1 秒返回，不是 180 秒超时）: %s"
-                              % (consumer_id, pn + 1,
-                                 str(result.get("data", ""))[:120]))
+                        print("[自动恢复] 第 %d 页未取到内容，正在重建引擎后重跑（不影响结果）"
+                              % (pn + 1))
                     elif _is_timeout:
                         elapsed = time.time() - t_page
-                        print(f"[Watchdog] Consumer-{consumer_id} Page {pn+1} 超时 {elapsed:.0f}s (limit={timeout_sec}s)")
+                        print("[自动恢复] 第 %d 页等待过久（%.0f 秒），正在重建引擎后重跑（不影响结果）"
+                              % (pn + 1, elapsed))
                     else:
-                        # 【2026-10-10 修复·之八】把「连接被重置」和「引擎真的坏了」分开讲。
-                        # code=102 在真超时之外只剩 TCP error（10053/10054）：那只说明
-                        # 这一条连接断了，引擎进程往往完全健康、原地重发即可 ——
-                        # 绝不该让用户以为「引擎坏了」。旧文案一律打「引擎层故障=True」，
-                        # 用户为此连问三次「引擎层故障是怎么回事」。
+                        # 【v1.3.3】两类失败分开报，语气按「要不要用户操心」定：
+                        #   · 单条 TCP 连接被重置（10053/10054）—— 引擎进程完好，
+                        #     程序自动取回该页，**无需用户做任何事** → 平实一句，
+                        #     且刻意不含 error/错误/失败/超时 等会被日志窗口标红的关键字；
+                        #   · 其它引擎层错误 —— 可能真需要关注 → 保留告警语气。
                         _data_l = str(result.get("data", ""))
-                        _kind = ("连接被重置，本页将原地重发（引擎进程正常）"
-                                 if "tcp error" in _data_l.lower()
-                                 else "引擎层错误")
-                        print("[Watchdog] Consumer-%d Page %d 出错 code=%s（%s）: %s"
-                              % (consumer_id, pn + 1, result.get("code"),
-                                 _kind, _data_l[:120]))
+                        if "tcp error" in _data_l.lower():
+                            # 【日志收敛】良性抖动：只计数，不逐页刷屏（本册结束汇总一行）
+                            with _tcp_jitter_lock:
+                                _tcp_jitter[0] += 1
+                        else:
+                            print("[自动恢复] 第 %d 页未取到内容，正在自动重跑（不影响结果）"
+                                  % (pn + 1))
                     if (_is_unavailable or _engines_dead) and _engine_recover < 1:
                         # 【2026-10-10 修复·之六】引擎确实坏了 → 重建两个引擎后
                         # **重发同一页**。这次重建不消耗页级重试预算（它是基础设施
                         # 恢复，不是"这一页又试了一次"），否则引擎崩一次就足以把
                         # 重试次数用光、直接升级成整份文件重跑。每页最多 1 次。
                         _engine_recover += 1
-                        print("[Watchdog] Tier1: restarting ALL engine instances"
-                              "（%s；重建后重发本页，不计入页重试）"
-                              % ("引擎不可用" if _is_unavailable
-                                 else "引擎进程已退出"))
+                        print("[自动恢复] 引擎已重建，本页重新识别（不影响结果）")
                         self.ocr.restart_all()
                         continue
                     if _page_retry < self.MAX_PAGE_RETRY:
-                        # ① 重新处理该页（最多 MAX_PAGE_RETRY 次）
+                        # ① 重新处理该页（最多 MAX_PAGE_RETRY 次）—— 全自动，
+                        #    无需用户介入，故不再单独刷一行日志。
                         _page_retry += 1
-                        print("[Watchdog] → 重发第 %d 页（第 %d/%d 次；页号不连续是"
-                              "并行渲染分段所致，不代表跳过了前面的页）"
-                              % (pn + 1, _page_retry, self.MAX_PAGE_RETRY))
                         if _is_timeout:
                             # 【2026-10-10 修复·之六】真超时 = 引擎假死
                             # （进程活着但 180 秒不回复）→ 必须先重建两个引擎，
                             # 重试才有意义。而「连接被 RST」（10053/10054）不算，
                             # 那种情况引擎进程好好的，原地重发就够了。
-                            print("[Watchdog] Tier1: restarting ALL engine instances"
-                                  "（真超时 → 引擎假死）")
+                            print("[自动恢复] 引擎已重建，本页重新识别（不影响结果）")
                             self.ocr.restart_all()
                         continue
                     # ② 单页重试用尽 → 触发全文件重处理（外层 for _full_retry 循环）
-                    print("[Watchdog] Tier2: 第 %d 页重试 %d 次仍失败 → 全文件重处理"
-                          % (pn + 1, self.MAX_PAGE_RETRY))
+                    print("[自动恢复] 本文件需要重新处理一遍（第 %d 页仍未取到内容）"
+                          % (pn + 1))
                     self._need_restart = True
                     self._cancelled = True
                     self.ocr.force_close()
@@ -2471,26 +2461,27 @@ class PDFProcessor:
                     _show = "、".join(str(p + 1) for p in _bad[:10])
                     if len(_bad) > 10:
                         _show += " …"
-                    print("[Watchdog] 完整性校验未通过：%d/%d 页没有有效结果（页码：%s）"
+                    print("[自动恢复] 完整性复核：%d/%d 页尚未取到内容（页码：%s）"
                           % (len(_bad), total_pages, _show))
                     if _full_retry < self.MAX_FILE_RETRY:
-                        print("[Watchdog] → 触发全文件重处理（第 %d/%d 次）"
+                        print("[自动恢复] → 正在重跑本文件（第 %d/%d 次）"
                               % (_full_retry + 1, self.MAX_FILE_RETRY))
                     else:
-                        print("[Watchdog] → 全文件重处理已用尽 → 跳过本文件并生成警告文件")
+                        print("[自动恢复] → 本文件已重跑 %d 次仍未取到全部页，将生成提示文件"
+                              % self.MAX_FILE_RETRY)
                     self._need_restart = True
             # 【2026-10-10 修复·之十一】用户取消时绝不允许进入「整份文件重处理」——
             # 这一条以前无条件执行，会把 _cancelled 复位成 False，于是取消 = 从头重跑。
             if (self._need_restart and not self._user_cancelled
                     and _full_retry < self.MAX_FILE_RETRY):
-                print(f"[Watchdog] Full file restart #{_full_retry+1} triggered. Cleaning up...")
+                print("[自动恢复] 正在重新处理本文件（第 %d 次）…" % (_full_retry + 1))
                 self._cancelled = True
                 self.ocr.force_close()
                 time.sleep(2)
                 # 【2026-10-09 修复】原来是 restart_all()：但上面 force_close() 已经把
                 # _instances 清空，restart_all() 遍历空列表 = 什么都没重建（恢复失效）。
                 # 改用 rebuild()：按记住的构造参数把两个引擎真正重新启动起来。
-                print(f"[Watchdog] Rebuilding all engines for restart...")
+                print("[自动恢复] 正在重建引擎…")
                 self.ocr.rebuild()
                 self._cancelled = False
                 self.results = {}
@@ -2499,6 +2490,11 @@ class PDFProcessor:
                 self._need_restart = False
                 continue
             break
+        # 【2026-10-10 · 日志收敛】本册处理完毕：把「连接瞬时中断」汇总成一行。
+        # 有才打、没有不打；不重试、不影响结果，只是让用户知道「抖动过几次、已自动取回」。
+        if _tcp_jitter[0]:
+            print("[自动恢复] 本册共 %d 页连接瞬时中断，均已自动取回（不影响结果）"
+                  % _tcp_jitter[0])
         if self._cancelled and not self._need_restart:
             return None, None
         if self._need_restart:
@@ -3335,10 +3331,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CathayOCR Pro (专业版) - 多引擎PDF处理器")
-        # ── 系统托盘：只作「显示 / 退出」入口，不接管最小化（详见 _setup_tray）──
-        self._tray = None
-        self._quitting = False
+        self.setWindowTitle("CathayOCR Pro (专业版) v1.3.5 - 多引擎PDF处理器")
         # ── 迷你窗口：处理中把两个窗口收成一张右下角小进度卡（详见 MiniWindow）──
         self._mini = None
         self._mini_active = False
@@ -3390,6 +3383,20 @@ class MainWindow(QMainWindow):
             "处理结束或点卡片上的「恢复」会自动还原（不影响识别功能）")
         self.mini_btn.clicked.connect(self.enter_mini_mode)
         ms_layout.addWidget(self.mini_btn)
+        # ── 「运行日志」：调出启动器的独立日志窗口（跨进程，只能按窗口标题找）──
+        #    （旧版该入口挂在系统托盘菜单里；托盘移除后改为主界面按钮 + F12）
+        self.log_btn = QPushButton("📋 运行日志")
+        self.log_btn.setCursor(Qt.PointingHandCursor)
+        self.log_btn.setStyleSheet(
+            "QPushButton{border:1px solid #cfd6dd;border-radius:4px;padding:3px 10px;"
+            "background:#f5f7f9;color:#4a5a6a;}"
+            "QPushButton:hover{background:#1a73e8;color:#ffffff;border-color:#1a73e8;}")
+        self.log_btn.setToolTip(
+            "把启动器的「运行日志窗口」调到最前面（快捷键 F12）。\n"
+            "该窗口显示本程序的控制台输出；若它已被关闭，\n"
+            "可重启 EXE 恢复，或查看软件目录下的 logs 文件夹。")
+        self.log_btn.clicked.connect(self._show_log_window)
+        ms_layout.addWidget(self.log_btn)
         self.ui_simple_btn.toggled.connect(self._on_ui_mode_changed)
         layout.addWidget(ms_widget)
 
@@ -3820,21 +3827,38 @@ class MainWindow(QMainWindow):
         ml.addLayout(fb)
         # 选中列表项后按 Delete 键 = 删除选中（仅在列表获得焦点时生效）
         _del_sc = QShortcut(QKeySequence.Delete, self.file_list, self.remove_selected_files)
+        # F12：调出运行日志窗口（与顶部「📋 运行日志」按钮同源）
+        self._log_sc = QShortcut(QKeySequence("F12"), self, self._show_log_window)
         _del_sc.setContext(Qt.WidgetWithChildrenShortcut)
         layout.addWidget(mg)
 
         # === 输出 ===
         og2 = QGroupBox("输出目录")
-        ol2 = QHBoxLayout(og2)
+        ol2v = QVBoxLayout(og2)
+        ol2 = QHBoxLayout()
         self.output_edit = QLineEdit()
         # 输出目录默认留空 = 输出到每个 PDF 自己所在的目录。
         # 不用上次记住的路径回填：否则「默认值」实际是个旧路径，容易误导出到别处。
         # 上次用过的目录仍记在 _last_output_dir，只作为「浏览」对话框的起始位置。
         self.output_edit.setPlaceholderText("留空 = 输出到每个 PDF 所在的目录（原目录）")
+        self.output_edit.setToolTip(
+            "输出目录\n"
+            "  · 留空（默认）：识别结果与源 PDF 放在同一个文件夹里\n"
+            "  · 填写后：本次所有识别结果统一输出到该文件夹\n"
+            "  · 「浏览」对话框会从上次用过的目录开始"
+        )
         ol2.addWidget(self.output_edit)
         self.browse_output_btn = QPushButton("浏览...")
         self.browse_output_btn.clicked.connect(self.browse_output)
         ol2.addWidget(self.browse_output_btn)
+        ol2v.addLayout(ol2)
+        _ohint = QLabel(
+            "说明：默认输出到每个 PDF 自己所在的文件夹（识别结果与源文件放在一起）；"
+            "填写目录后，本次结果统一输出到该目录。"
+        )
+        _ohint.setWordWrap(True)
+        _ohint.setStyleSheet("color: #808080;")
+        ol2v.addWidget(_ohint)
         layout.addWidget(og2)
 
         # === 进度 ===
@@ -4130,7 +4154,13 @@ class MainWindow(QMainWindow):
         #   注意：Vulkan 探测拿不到显存大小，AMD/Intel 一律保守按"小显存档"(3)；
         #   用户若是 ≥12GB 的 A/I 卡，可在下拉里手动改选第 3 项。
         try:
-            for dev in self._detect_vulkan_gpus():
+            # 【2026-10-10 修复】这里原来写的是 self._detect_vulkan_gpus()，
+            # 而 MainWindow 并没有这个方法 —— 运行时抛 AttributeError，
+            # 又被本段的 except Exception: pass 静默吞掉，导致「方式2：
+            # Vulkan 探测独显」这一条**永远不生效**（AMD/Intel 独显在
+            # nvidia-smi 不可用时，会被一路判成"核显/纯CPU"档）。
+            # 它是模块级函数，必须裸调用。
+            for dev in _detect_vulkan_gpus():
                 if not dev.get("dedicated"):
                     continue
                 name = dev.get("name", "").lower()
@@ -4413,7 +4443,12 @@ class MainWindow(QMainWindow):
         if target_engine == "ncnn_cpu":          # 已隐藏的引擎，未注册，兜一个名字
             engine_name = "PP-OCR (ncnn CPU)"
         model_label = target_model
-        gpu_text = "(GPU)" if target_mode != "cpu" else "(CPU)"
+        # 模式后缀只对「支持 GPU 的引擎」有意义：ncnn / V6 有 GPU·CPU 两态；
+        # 纯 CPU 引擎（PP-OCRv5 / PP-OCRv3 Paddle CPU、EasyOCR）名字里已写明 CPU，
+        # 再叠一个 (GPU) 会拼成「PP-OCRv5 (Paddle CPU) (GPU)」这种自相矛盾的串。
+        gpu_text = ""
+        if ENGINE_REGISTRY.get(target_engine, {}).get("gpu"):
+            gpu_text = "(GPU)" if target_mode != "cpu" else "(CPU)"
         scale_label = ["1x", "2x", "3x"][target_scale]
         vertical_label = "开" if target_vertical else "关"
         angle_label = "开" if target_angle else "关"
@@ -4437,7 +4472,8 @@ class MainWindow(QMainWindow):
         lang_text = self._current_lang_name() if hasattr(self, 'lang_combo') else "—"
 
         # 一行灰色摘要
-        preview_parts = [f"{engine_name} {gpu_text}", f"模型 {model_label}", f"{lang_text}",
+        _engine_label = f"{engine_name} {gpu_text}".strip()
+        preview_parts = [_engine_label, f"模型 {model_label}", f"{lang_text}",
                         f"边长{target_side}", f"渲染{scale_label}",
                         f"批数{target_rec_batch}", f"精度{precision_label}",
                         f"双实例{dual_label}", f"对齐{shrink_label}"]
@@ -5106,6 +5142,34 @@ class MainWindow(QMainWindow):
         if d:
             self.output_edit.setText(d)
             self._last_output_dir = d
+    def _show_log_window(self):
+        """把启动器的「运行日志窗口」调到最前面 —— 跨进程，只能按窗口标题查找。
+
+        日志窗口是启动器（CathayOCR Pro.exe）里的 tkinter 窗口，独立进程；
+        这里只做「显示/还原 + 置顶 + 聚焦」，不改它的任何状态。
+        """
+        # 该窗口是主窗口的「从属窗口」（启动器用 GWLP_HWNDPARENT 登记）：
+        # 主窗口隐藏时它也显示不出来 → 迷你模式下先把主界面还原回来。
+        try:
+            if getattr(self, "_mini_active", False):
+                self.exit_mini_mode()
+        except Exception:
+            pass
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            hwnd = u.FindWindowW("TkTopLevel", self.LOG_WINDOW_TITLE)
+            if not hwnd:
+                hwnd = u.FindWindowW(None, self.LOG_WINDOW_TITLE)
+            if not hwnd:
+                self.log("（没找到「运行日志窗口」—— 它可能已被关闭。重启 CathayOCR Pro.exe 可恢复；历史日志见软件目录下的 logs 文件夹）")
+                return
+            u.ShowWindow(hwnd, 9)          # SW_RESTORE：还原并显示（含最小化状态）
+            u.BringWindowToTop(hwnd)
+            u.SetForegroundWindow(hwnd)
+        except Exception as e:
+            print("[Log] 调出日志窗口失败: %s" % e)
+
     def log(self, msg):
         ts = time.strftime("%H:%M:%S")
         self.log_text.append(f"[{ts}] {msg}")
@@ -5244,9 +5308,12 @@ class MainWindow(QMainWindow):
         self.processed_files = 0
         self.overall_progress.setValue(0)
         einfo = ENGINE_REGISTRY.get(engine_id, {})
-        mode_str = "GPU" if use_gpu else "CPU"
+        # 纯 CPU 引擎（PP-OCRv5 / PP-OCRv3 Paddle CPU、EasyOCR）名称里已写明 CPU，
+        # 不再重复拼模式后缀，避免日志出现「PP-OCRv5 (Paddle CPU) (CPU)」。
+        mode_str = ("GPU" if use_gpu else "CPU") if einfo.get("gpu") else ""
         self.log(f"开始处理 {self.total_files} 个文件")
-        self.log("  引擎: " + einfo.get("name", engine_id) + " (" + mode_str + ")")
+        self.log("  引擎: " + einfo.get("name", engine_id)
+                 + (f" ({mode_str})" if mode_str else ""))
         self.log(f"  模型: {model_size} | 边长: {limit_side_len} | 渲染: {scale}x")
         self.worker = BatchWorkerThread(
             file_list, output_dir,
@@ -5464,17 +5531,17 @@ class MainWindow(QMainWindow):
             pass
 
     # ════════════════════════════════════════════════════════════
-    # 系统托盘（只作入口）+ 迷你窗口（真正的「收小」方案）
+    # 迷你窗口（把「主窗口 + 日志窗口」一起收小的方案）
     # ------------------------------------------------------------
-    # 设计意图（2026-10-09 修订）：
-    #   * 最小化 = 普通最小化到任务栏。**不再收进托盘** —— Windows 11 会把新程序的
-    #     托盘图标默认折进「隐藏的图标」里，用户最小化后容易连窗口带图标一起找不到；
-    #   * 托盘图标只保留「显示主界面 / 显示运行日志窗口 / 退出程序」三个入口
-    #     （日志窗口的调出是跨进程的，用 Win32 FindWindow 按标题找）；
-    #   * 想「把两个窗口收小」请用迷你窗口模式：见 MiniWindow / enter_mini_mode。
+    # 设计意图（2026-10-10 修订）：
+    #   * 最小化 = 普通最小化到任务栏；v1.3.1 起**不再有系统托盘**；
+    #   * 想把两个窗口一起收小，请用迷你窗口模式：主窗口 hide()，启动器的日志窗口
+    #     作为从属窗口自动一起收起，右下角留一张小进度卡。见 MiniWindow / enter_mini_mode。
     # ════════════════════════════════════════════════════════════
     APP_DISPLAY_NAME = "CathayOCR Pro"
-    LOG_WINDOW_TITLE = "CathayOCR Pro — 运行日志"   # 必须与启动器 APP_TITLE 一致
+    # 启动器「运行日志窗口」的标题 —— 必须与 launcher 里的 APP_TITLE 完全一致，
+    # 否则跨进程 FindWindowW 找不到那个窗口（只能按标题找）。
+    LOG_WINDOW_TITLE = "CathayOCR Pro — 运行日志"
 
     def _set_app_icon(self):
         """窗口图标 —— 与启动器的日志窗口用同一个 ico，看起来就是同一个程序。"""
@@ -5484,92 +5551,6 @@ class MainWindow(QMainWindow):
                 self.setWindowIcon(QIcon(ico))
         except Exception:
             pass
-
-    def _setup_tray(self):
-        """建立系统托盘图标。只作「显示 / 退出」的便捷入口，不接管最小化。
-
-        托盘不可用时静默跳过，一切照旧。
-        """
-        try:
-            if not QSystemTrayIcon.isSystemTrayAvailable():
-                print("[Tray] 系统托盘不可用，跳过")
-                return False
-        except Exception:
-            return False
-        try:
-            icon = self.windowIcon()
-            if icon is None or icon.isNull():
-                ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CathayOCR.ico")
-                icon = QIcon(ico) if os.path.isfile(ico) else QIcon()
-            if icon.isNull():
-                icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
-            self._tray = QSystemTrayIcon(icon, self)
-            self._tray.setToolTip("%s —— 双击显示主界面" % self.APP_DISPLAY_NAME)
-
-            menu = QMenu(self)
-            act_show = QAction("显示主界面", self)
-            act_show.triggered.connect(self._restore_from_tray)
-            menu.addAction(act_show)
-            act_log = QAction("显示运行日志窗口", self)
-            act_log.triggered.connect(self._show_log_window)
-            menu.addAction(act_log)
-            menu.addSeparator()
-            act_quit = QAction("退出程序", self)
-            act_quit.triggered.connect(self._quit_from_tray)
-            menu.addAction(act_quit)
-
-            self._tray.setContextMenu(menu)
-            self._tray.activated.connect(self._on_tray_activated)
-            self._tray.show()
-            print("[Tray] 托盘图标已就绪（仅作显示/退出入口；最小化 = 进任务栏）")
-            return True
-        except Exception as e:
-            print("[Tray] 建立失败: %s" % e)
-            self._tray = None
-            return False
-
-    def _on_tray_activated(self, reason):
-        try:
-            if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
-                self._restore_from_tray()
-        except Exception:
-            pass
-
-    def _restore_from_tray(self):
-        """显示主界面（日志窗口由启动器自动一起还原）。"""
-        if self._mini_active:
-            self.exit_mini_mode()          # 迷你模式中点托盘 → 直接还原完整窗口
-            return
-        try:
-            self.showNormal()
-            self.raise_()
-            self.activateWindow()
-        except Exception:
-            pass
-
-    def _show_log_window(self):
-        """把启动器的日志窗口调出来 —— 跨进程，用 Win32 按窗口标题查找。
-
-        （日志窗口是独立进程里的 tkinter 窗口，这里只做「显示 + 置顶」，不改它的状态。）
-        """
-        try:
-            import ctypes
-            u = ctypes.windll.user32
-            hwnd = u.FindWindowW(None, self.LOG_WINDOW_TITLE)
-            if not hwnd:
-                hwnd = u.FindWindowW("TkTopLevel", self.LOG_WINDOW_TITLE)
-            if not hwnd:
-                self.log("（日志窗口不在运行 —— 直接双击 CathayOCR Pro.exe 即可打开）")
-                return
-            u.ShowWindow(hwnd, 5)          # SW_SHOW
-            u.BringWindowToTop(hwnd)
-            u.SetForegroundWindow(hwnd)
-        except Exception as e:
-            print("[Tray] 调出日志窗口失败: %s" % e)
-
-    def _quit_from_tray(self):
-        self._quitting = True
-        self.close()                       # 走正常关闭流程（清理引擎 + 落盘设置）
 
     # ════════════════════════════════════════════════════════════
     # 迷你窗口模式（纯 UI：只读进度、只改窗口形态，不碰识别流程）
@@ -5681,14 +5662,6 @@ class MainWindow(QMainWindow):
                 self._mini.hide()
                 self._mini.deleteLater()
                 self._mini = None
-        except Exception:
-            pass
-        # 先把托盘图标摘掉，否则关窗后托盘里会留一个点不动的"幽灵图标"
-        try:
-            if self._tray is not None:
-                self._tray.hide()
-                self._tray.setVisible(False)
-                self._tray = None
         except Exception:
             pass
         # 【修复】关窗时先落盘设置。
@@ -6019,6 +5992,5 @@ if __name__ == '__main__':
     app.setStyle('Fusion')
     window = MainWindow()
     window._restore_engine_settings()
-    window._setup_tray()          # 系统托盘：最小化时与日志窗口一起收起
     window.show()
     sys.exit(app.exec_())

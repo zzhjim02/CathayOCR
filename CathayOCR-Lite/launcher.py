@@ -709,7 +709,7 @@ class LauncherApp:
         # 点日志窗口 → 把主程序窗口一起提到前面（两窗是一个整体，见 _on_log_focus）
         root.bind("<FocusIn>", self._on_log_focus, add="+")
 
-        self._log("info", "CathayOCR Lite 启动器 v1.3.0")
+        self._log("info", "CathayOCR Lite 启动器 v1.3.5")
         self._log("dim", "项目目录 : %s" % ROOT_DIR)
         self._log("dim", "解释器   : %s" % PYTHON)
         self._log("dim", "主程序   : %s" % MAIN_PY)

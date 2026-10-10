@@ -19,12 +19,11 @@
 
 </div>
 
-> ⚠️ **如果你使用的是 v1.2.3 及更早版本，请更新到 v1.2.4：**
+> 🟢 **稳定版 v1.2.4** —— 经过长期验证，推荐**绝大多数用户**使用 👉 [⬇️ 下载 v1.2.4](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.4)
 >
-> 🐛 **除 Vulkan 外其他引擎全部不可用** — 选 PP-OCRv6 / PP-OCRv5 / 经典版 / ncnn CPU / EasyOCR 处理，导出结果为空？已修复 ✅（Pro / Dev，v1.2.4 起）
-> 🐛 上述版本另含 v1.2.3 的全部修复：竖排识别无效 · 竖排 PDF 搜不到文字 · 导出文字落页面外 · 覆盖旧OCR · TXT 文本层写回工具
+> 🟡 **测试版 v1.3.5（最新）** —— 新增多引擎、多语言修正、引擎恢复与完整性改进，**仍在测试中**，尝鲜 / 协助测试可选 👉 [⬇️ 下载 v1.3.5](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.3.5)
 >
-> ⬇️ [点击这里直接下载 v1.2.4](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.4)
+> ⚠️ 如果你使用的是 **v1.2.3 及更早版本**，请务必更新：v1.2.4 修复了「除 Vulkan 外其他引擎全部不可用」等严重问题。
 ---
 
 ## 🔗 Cathay 人文社科工具链
@@ -35,7 +34,7 @@
 |:---:|---|---|---|
 | ⓪ | [CathayRepair](https://github.com/zzhjim02/CathayRepair) | PDF 打不开、一翻就崩 → 先把它抢救回来 | v1.0.0 |
 | ① | [CathayPDG](https://github.com/zzhjim02/CathayPDG) | 读秀 / 超星的 PDG 压缩包 → PDF | v0.2.0 |
-| **②** | **CathayOCR（你在这里）** | 扫描件做 OCR → 能搜索、能复制的 PDF | **v1.2.4** |
+| **②** | **CathayOCR（你在这里）** | 扫描件做 OCR → 能搜索、能复制的 PDF | **v1.2.4 稳定 / v1.3.5 测试** |
 | ③ | [CathayRestore](https://github.com/zzhjim02/CathayRestore) | 把 OCR 出来的 TXT 写回 PDF，做成双层 | v1.0.0 |
 | ④ | [CathayExtract](https://github.com/zzhjim02/CathayExtract) | 已经是双层 PDF → 直接把文字抽成 TXT | v1.2.3 |
 | ⑤ | [CathayShelf](https://github.com/zzhjim02/CathayShelf) | 批量建档归位、规范命名、繁简转换 | v0.4.8 |
@@ -349,19 +348,44 @@ graph TD
 
 ---
 
-### 🚀 推荐下载（最新版 v1.2.4）
+### 🚀 推荐下载
 
-> 📌 **v1.2.4 更新**：修复除 ncnn Vulkan 外其他引擎全部不可用的问题（Pro / Dev）——此前选 PP-OCRv6 / PP-OCRv5 / 经典版 / ncnn CPU / EasyOCR 处理，导出结果没有文字。Lite 仅有 Vulkan 引擎，不受影响，其安装包与 v1.2.3 完全相同（下方直接下载即可）。详见下方 [v1.2.4 更新说明](#-v124-更新说明)。
+> 📌 **两个版本，按需选择：**
+>
+> | | 版本 | 说明 |
+> |:--:|:--|:--|
+> | 🟢 | **v1.2.4 稳定版** | 经过长期验证，**推荐绝大多数用户** |
+> | 🟡 | **v1.3.5 测试版（最新）** | 新增多引擎、多语言修正、引擎恢复与完整性改进；**仍在测试中**，尝鲜 / 协助测试可选 |
 
-#### ① Lite 轻量版（~640 MB）← 大多数人选这个！
+---
+
+#### 🟡 v1.3.5 测试版（最新）
+
+> 📌 **v1.3.5 更新**：在 v1.2.4 基础上引入多引擎架构（PP-OCRv6 ONNX CUDA / PP-OCRv5 / PP-OCRv3 / EasyOCR / ncnn CPU 等）、多语言路由修正（西里尔、韩、阿、天城、泰等）、引擎恢复三级策略与「丢页闸门」完整性保护，并修复大量稳定性问题。**本版仍在测试中**，如遇问题欢迎反馈。
+
+| 版本 | 大小 | 下载 |
+|:--|:--|:--|
+| **① Lite 轻量版** | ~650 MB（.zip） | [⬇️ GitHub Releases](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.3.5) · [📦 百度网盘](https://pan.baidu.com/s/13NbKzXrBq1ooR5rc2M-0uQ?pwd=2026)（密码 2026） |
+| **② Pro 专业版** | ~5.0 GB（.7z） | [📦 百度网盘](https://pan.baidu.com/s/13NbKzXrBq1ooR5rc2M-0uQ?pwd=2026)（密码 2026） |
+
+> 💡 Lite 轻量版同时上传到 GitHub Releases；Pro 专业版体积较大（~5 GB .7z），仅通过网盘分发。
+
+---
+
+#### 🟢 v1.2.4 稳定版（推荐）
+
+> 📌 **v1.2.4 更新**：修复除 ncnn Vulkan 外其他引擎全部不可用的问题（Pro / Dev）——此前选 PP-OCRv6 / PP-OCRv5 / 经典版 / ncnn CPU / EasyOCR 处理，导出结果没有文字。Lite 仅有 Vulkan 引擎，不受影响。详见下方 [v1.2.4 更新说明](#-v124-更新说明)。
+
+##### ① Lite 轻量版（~640 MB）← 大多数人选这个！
 适合识别中文、日文、韩文等常见语言，开箱即用。
 
 | 下载方式 | 链接 |
 |:-------|:-----|
 | 📦 **中国移动云盘**（推荐） | [点击下载](https://yun.139.com/shareweb/#/w/i/2xop1H8ckR7b0) |
 | 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1gHGWonDz2RvQfsUGikYiYA?pwd=2026) |
+| ⬇️ **GitHub Releases** | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.4) |
 
-#### ② Pro 专业版（~5.8 GB）
+##### ② Pro 专业版（~5.8 GB）
 需要识别阿拉伯文、天城文等稀有语言，或需要多引擎对比时选这个。
 
 | 下载方式 | 链接 |
@@ -369,13 +393,33 @@ graph TD
 | 📦 **中国移动云盘**（推荐） | [点击下载](<PRO_139_LINK_PLACEHOLDER>) |
 | 📦 **百度网盘**（备用，密码 2026） | [点击下载](<PRO_BAIDU_LINK_PLACEHOLDER>) |
 
-#### ③ DEV 开发版（~10 GB）
+##### ③ DEV 开发版（~10 GB）
 如果你想研究或修改代码，选这个（含全套源码和开发工具）。
 
 | 下载方式 | 链接 |
 |:-------|:-----|
 | 📦 **百度网盘**（密码 2026） | [点击下载](<DEV_BAIDU_LINK_PLACEHOLDER>) |
 | 📦 **中国移动云盘** | [点击下载](<DEV_139_LINK_PLACEHOLDER>) |
+
+---
+
+## 🆕 v1.3.5 更新说明（测试版）
+
+> 发布日期：2026-10-10 ｜ 状态：**测试版**（建议与 v1.2.4 稳定版并存）
+
+**在 v1.2.4 基础上，本次更新集中在「多引擎、多语言、稳定性与结果完整性」：**
+
+1. **多引擎架构** — UI 统一管理 6 个引擎：ncnn Vulkan / PP-OCRv6 (ONNX CUDA) / PP-OCRv5 (Paddle CPU) / PP-OCRv3 (Paddle CPU) / EasyOCR / ncnn CPU（Pro）。简单模式按「文档类型 → 精度速度 → 显卡 → 语言」自动配好参数。
+2. **多语言修正** —
+   - 西里尔（俄 / 乌 / 保）等在**任意显卡**上都会正确切到 Paddle CPU 分语种模型（此前无论什么显卡都只加载中 / 英 / 日字典 → 输出乱码）；
+   - 韩文 / 俄文自动回退官方 **PP-OCRv5 分语种模型**（PP-OCRv6 单模型仅覆盖 50 语种，不含韩文 / 西里尔）；
+   - 补齐普什图 / 信德 / 克什米尔 / 俾路支 / 博杰普尔 / 迈蒂利 / 孔卡尼等字母系语言，win7_v5 语种路由扩至 33 组。
+3. **引擎恢复三级策略 + 看门狗自愈** — 双实例轮询分页；明确区分「有文字 / 明确空白 / 引擎层错误 / 不可用」，仅在真故障时重启，避免误杀。
+4. **「丢页闸门」完整性保护**（本版重点）— 只要有任一页未被成功识别，就整份文件重跑；重试用尽仍不完整则**直接报错并写出警告文件**，绝不交付「少页看不出」的结果。
+5. **诊断增强** — 引擎 stderr 落盘、运行日志分级（保留全部细节，但不刷屏）。
+6. **GPU 卡死（TDR）应对** — 随包附 `GPU卡死修复_调大TDR超时_需重启.reg`：Windows 默认 2 秒 TDR 超时可能误杀长耗时任务，管理员运行该 .reg 并重启可调大超时。
+
+> ⚠️ 本版为**测试版**，建议与 v1.2.4 稳定版同时保留，日常主力仍可继续用 v1.2.4。
 
 ---
 
