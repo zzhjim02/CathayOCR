@@ -385,7 +385,7 @@ graph TD
 | 下载方式 | 链接 |
 |:-------|:-----|
 | 📦 **中国移动云盘**（推荐） | [点击下载](https://yun.139.com/shareweb/#/w/i/2xop1H8ckR7b0) |
-| 📦 **百度网盘**（备用，密码 2026） | [点击下载](https://pan.baidu.com/s/1gHGWonDz2RvQfsUGikYiYA?pwd=2026) |
+| 📦 **百度网盘**（含 Lite + Pro 两个版本，密码 2026） | [点击下载](https://pan.baidu.com/s/11fTzJ5dDr35ZtarMWOOU0Q?pwd=2026) |
 | ⬇️ **GitHub Releases** | [点击下载](https://github.com/zzhjim02/CathayOCR/releases/tag/v1.2.4) |
 
 ##### ② Pro 专业版（~5.8 GB）
@@ -393,8 +393,7 @@ graph TD
 
 | 下载方式 | 链接 |
 |:-------|:-----|
-| 📦 **中国移动云盘**（推荐） | [点击下载](<PRO_139_LINK_PLACEHOLDER>) |
-| 📦 **百度网盘**（备用，密码 2026） | [点击下载](<PRO_BAIDU_LINK_PLACEHOLDER>) |
+| 📦 **百度网盘**（含 Lite + Pro 两个版本，密码 2026） | [点击下载](https://pan.baidu.com/s/11fTzJ5dDr35ZtarMWOOU0Q?pwd=2026) |
 
 ##### ③ DEV 开发版（~10 GB）
 如果你想研究或修改代码，选这个（含全套源码和开发工具）。
